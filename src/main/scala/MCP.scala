@@ -38,16 +38,19 @@ object MCP:
   given throwableError: McpError[Throwable] with
     def message(e: Throwable): String = e.getMessage
 
-  private def logMcpErrors[R, E, A](toolName: String)(effect: ZIO[R, E, A]): ZIO[R, E, A] =
-    effect
-      .tapError(e => ZIO.logWarning(s"MCP tool error: tool=$toolName error=$e"))
-      .tapDefect(c => ZIO.logError(s"MCP tool defect: tool=$toolName cause=${c.prettyPrint}"))
+  private def logMcp[R, E, A](toolName: String, params: String)(effect: ZIO[R, E, A]): ZIO[R, E, A] =
+    defer:
+      ZIO.logInfo(s"MCP tool call: tool=$toolName params=$params").run
+      effect
+        .tapError(e => ZIO.logWarning(s"MCP tool error: tool=$toolName error=$e"))
+        .tapDefect(c => ZIO.logError(s"MCP tool defect: tool=$toolName cause=${c.prettyPrint}"))
+        .run
 
   val getLatestTool = McpTool("get_latest_version")
     .description("Gets the latest version of a given artifact")
     .annotations(readOnly = True, destructive = False, idempotent = True, openWorld = True)
     .handle: (input: GroupArtifact) =>
-      logMcpErrors("get_latest_version"):
+      logMcp("get_latest_version", input.toString):
         ZIO.scoped:
           Extractor.latest(input)
 
@@ -55,7 +58,7 @@ object MCP:
     .description("Gets the index from the javadocs for a given Maven Central library artifact - often the index provides helpful reference documentation")
     .annotations(readOnly = True, destructive = False, idempotent = True, openWorld = True)
     .handle: (input: GroupArtifactVersion) =>
-      logMcpErrors("get_javadoc_index"):
+      logMcp("get_javadoc_index", input.toString):
         ZIO.scoped:
           defer:
             SymbolSearch.indexJavadocContents(input).run
@@ -65,7 +68,7 @@ object MCP:
     .description("Gets a list of the contents of a javadoc jar")
     .annotations(readOnly = True, destructive = False, idempotent = True, openWorld = True)
     .handle: (input: GroupArtifactVersion) =>
-      logMcpErrors("get_javadoc_content_list"):
+      logMcp("get_javadoc_content_list", input.toString):
         ZIO.scoped:
           defer:
             SymbolSearch.indexJavadocContents(input).run
@@ -76,7 +79,7 @@ object MCP:
     .annotations(readOnly = True, destructive = False, idempotent = True, openWorld = True)
     .handle: (input: JavadocSymbol) =>
       val groupArtifactVersion = GroupArtifactVersion(input.groupId, input.artifactId, input.version)
-      logMcpErrors("get_javadoc_symbol_contents"):
+      logMcp("get_javadoc_symbol_contents", input.toString):
         ZIO.scoped:
           Extractor.javadocSymbolContents(groupArtifactVersion, input.link)
 
@@ -84,7 +87,7 @@ object MCP:
     .description("Gets a list of the contents of a source jar")
     .annotations(readOnly = True, destructive = False, idempotent = True, openWorld = True)
     .handle: (input: GroupArtifactVersion) =>
-      logMcpErrors("list_source_contents"):
+      logMcp("list_source_contents", input.toString):
         ZIO.scoped:
           Extractor.sourceContents(input)
 
@@ -93,7 +96,7 @@ object MCP:
     .annotations(readOnly = True, destructive = False, idempotent = True, openWorld = True)
     .handle: (input: JavadocSymbol) =>
       val groupArtifactVersion = GroupArtifactVersion(input.groupId, input.artifactId, input.version)
-      logMcpErrors("get_source_contents"):
+      logMcp("get_source_contents", input.toString):
         ZIO.scoped:
           Extractor.sourceFileContents(groupArtifactVersion, input.link)
 
@@ -101,14 +104,14 @@ object MCP:
     .description("Searches indexed Maven Central library artifacts by partial group id or artifact id (case insensitive)")
     .annotations(readOnly = True, destructive = False, idempotent = True, openWorld = True)
     .handle: (input: Symbol) =>
-      logMcpErrors("search_artifacts"):
+      logMcp("search_artifacts", input.query):
         SymbolSearch.searchGroupArtifacts(input.query)
 
   val symbolToArtifactTool = McpTool("symbol_to_artifact")
     .description("Gets the group and artifact for a given symbol, class, or package. Symbol search is case sensitive.")
     .annotations(readOnly = True, destructive = False, idempotent = False, openWorld = True)
     .handle: (input: Symbol) =>
-      logMcpErrors("symbol_to_artifact"):
+      logMcp("symbol_to_artifact", input.query):
         ZIO.scoped:
           // todo: rate limit
           SymbolSearch.search(input.query)
