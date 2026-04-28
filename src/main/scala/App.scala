@@ -87,19 +87,6 @@ object App extends ZIOAppDefault:
       .orElse:
         Response.html(UI.page("javadocs.dev", UI.invalidGroupArtifact(groupId, artifactId, groupIdValid = false)), Status.NotFound).toHandler
 
-  // we only want to trigger symbol cache loading when the index page is loaded
-  // this is a lazy way to populate the cache
-  // todo: we probably only want to do this periodically so maybe we maintain a Ref that we can check before we actually do this
-  def indexJavadocContents(groupArtifactVersion: MavenCentral.GroupArtifactVersion):
-    ZIO[Client & Extractor.FetchBlocker & Extractor.JavadocCache & Redis & SymbolSearch.SymbolSearchGuard & Scope, Nothing, Unit] =
-
-    val getContentsAndUpdateIndex = for
-      contents <- Extractor.javadocContents(groupArtifactVersion)
-      _ <- SymbolSearch.update(groupArtifactVersion, contents)
-    yield ()
-
-    getContentsAndUpdateIndex.forkDaemon.unit
-
   given zio.json.JsonEncoder[Extractor.Content] = zio.json.DeriveJsonEncoder.gen[Extractor.Content]
 
   def withVersion(groupId: MavenCentral.GroupId, artifactId: MavenCentral.ArtifactId, version: MavenCentral.Version, request: Request):
@@ -190,7 +177,7 @@ object App extends ZIOAppDefault:
         ZIO.scoped:
           defer:
             val javadocDir = ZIO.serviceWithZIO[Extractor.JavadocCache](_.cache.get(groupArtifactVersion)).run
-            ZIO.when(file.toString == "index.html")(indexJavadocContents(groupArtifactVersion)).run // update the cache
+            ZIO.when(file.toString == "index.html")(SymbolSearch.indexJavadocContents(groupArtifactVersion)).run // update the cache
             Extractor.javadocFile(groupArtifactVersion, javadocDir, file.toString).run
           .catchAll(e => ZIO.fail(JavadocException(e)))
       .contramap[(MavenCentral.GroupId, MavenCentral.ArtifactId, MavenCentral.Version, Path, Request)](_._5) // not sure why fromFileZIO doesn't have an IN param anymore

@@ -58,7 +58,7 @@ object MCP:
       logMcpErrors("get_javadoc_index"):
         ZIO.scoped:
           defer:
-            App.indexJavadocContents(input).run
+            SymbolSearch.indexJavadocContents(input).run
             Extractor.index(input).run
 
   val getClassesTool = McpTool("get_javadoc_content_list")
@@ -68,7 +68,7 @@ object MCP:
       logMcpErrors("get_javadoc_content_list"):
         ZIO.scoped:
           defer:
-            App.indexJavadocContents(input).run
+            SymbolSearch.indexJavadocContents(input).run
             Extractor.javadocContents(input).run
 
   val getSymbolContentsTool = McpTool("get_javadoc_symbol_contents")

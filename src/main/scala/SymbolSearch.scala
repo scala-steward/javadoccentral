@@ -131,6 +131,9 @@ object SymbolSearch:
               (keys, next)
         .runCollect.mapError(e => SearchError(e.toString)).run.flatten.filter(!_.startsWith("_"))
 
+        ZIO.logInfo(s"Symbol search: pattern=$pattern keys=${allKeys.size}").run
+
+        // this should be a very small number of groupArtifacts
         ZIO.foreachPar(allKeys): key =>
           redis.sMembers(key).returning[MavenCentral.GroupArtifact].catchAll: e =>
             defer:
@@ -148,16 +151,17 @@ object SymbolSearch:
         val aiResults = aiSearch(symbol).mapError(e => SearchError(e.message)).tapError: e =>
           ZIO.logError(s"aiSearch failed for symbol: $symbol: ${e.message}")
         .run
+        ZIO.logInfo(s"AI search: symbol=$symbol results=${aiResults.size}").run
         val validatedResults = ZIO.filterPar(aiResults): ga =>
           MavenCentral.isArtifact(ga.groupId, ga.artifactId).orElseSucceed(false)
         .run
-        .toSet
         val indexLoad = validatedResults.map:
           groupArtifact =>
             Extractor.latest(groupArtifact).flatMap:
               latest =>
-                App.indexJavadocContents(MavenCentral.GroupArtifactVersion(groupArtifact.groupId, groupArtifact.artifactId, latest))
+                indexJavadocContents(MavenCentral.GroupArtifactVersion(groupArtifact.groupId, groupArtifact.artifactId, latest))
             .ignore
+        ZIO.logInfo(s"Scheduling index load: symbol=$symbol artifacts=${validatedResults.size}").run
         ZIO.collectAllParDiscard(indexLoad).forkDaemon.run
         validatedResults
       else
@@ -206,3 +210,17 @@ object SymbolSearch:
               redis.hSet(gavCacheKey, gaKey -> version).unit.run
               ZIO.logInfo(s"Updated symbol index: $groupArtifactVersion symbols=${symbols.size}").run
             work.ensuring(guard.remove(groupArtifactVersion)).run
+
+  // we only want to trigger symbol cache loading when the index page is loaded
+  // this is a lazy way to populate the cache
+  def indexJavadocContents(groupArtifactVersion: MavenCentral.GroupArtifactVersion):
+    ZIO[Client & Extractor.FetchBlocker & Extractor.JavadocCache & Redis & SymbolSearch.SymbolSearchGuard & Scope, Nothing, Unit] =
+
+    val getContentsAndUpdateIndex = defer:
+      ZIO.logInfo(s"Index load started: $groupArtifactVersion").run
+      val (parseDuration, contents) = Extractor.javadocContents(groupArtifactVersion).timed.run
+      ZIO.logInfo(s"Index load parsed: $groupArtifactVersion symbols=${contents.size} duration=${parseDuration.toMillis}ms").run
+      SymbolSearch.update(groupArtifactVersion, contents).run
+      ZIO.logInfo(s"Index load complete: $groupArtifactVersion").run
+
+    getContentsAndUpdateIndex.forkDaemon.unit
