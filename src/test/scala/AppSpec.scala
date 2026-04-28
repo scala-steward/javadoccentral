@@ -178,4 +178,5 @@ object AppSpec extends ZIOSpecDefault:
     BadActor.live,
     App.crawlerEvictionsLayer,
       App.crawlerGavLimiterLayer,
+      App.symbolSearchGuardLayer,
   ) @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom @@ TestAspect.withLiveSystem @@ TestAspect.sequential

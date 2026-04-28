@@ -207,4 +207,5 @@ object McpSpec extends ZIOSpecDefault:
       BadActor.live,
       App.crawlerEvictionsLayer,
       App.crawlerGavLimiterLayer,
+      App.symbolSearchGuardLayer,
     ) @@ withLiveClock @@ timeout(3.minutes) @@ sequential

@@ -91,11 +91,11 @@ object App extends ZIOAppDefault:
   // this is a lazy way to populate the cache
   // todo: we probably only want to do this periodically so maybe we maintain a Ref that we can check before we actually do this
   def indexJavadocContents(groupArtifactVersion: MavenCentral.GroupArtifactVersion):
-    ZIO[Client & Extractor.FetchBlocker & Extractor.JavadocCache & Redis & Scope, Nothing, Unit] =
+    ZIO[Client & Extractor.FetchBlocker & Extractor.JavadocCache & Redis & SymbolSearch.SymbolSearchGuard & Scope, Nothing, Unit] =
 
     val getContentsAndUpdateIndex = for
       contents <- Extractor.javadocContents(groupArtifactVersion)
-      _ <- SymbolSearch.update(groupArtifactVersion.noVersion, contents)
+      _ <- SymbolSearch.update(groupArtifactVersion, contents)
     yield ()
 
     getContentsAndUpdateIndex.forkDaemon.unit
@@ -165,7 +165,7 @@ object App extends ZIOAppDefault:
   case class JavadocException(error: MavenCentral.NotFoundError | Extractor.JavadocFileNotFound) extends Exception
 
   def withFile(groupId: MavenCentral.GroupId, artifactId: MavenCentral.ArtifactId, version: MavenCentral.Version, file: Path, request: Request):
-      Handler[Extractor.FetchBlocker & Client & Extractor.TmpDir & Redis & Extractor.JavadocCache, Nothing, (MavenCentral.GroupId, MavenCentral.ArtifactId, MavenCentral.Version, Path, Request), Response] =
+      Handler[Extractor.FetchBlocker & Client & Extractor.TmpDir & Redis & Extractor.JavadocCache & SymbolSearch.SymbolSearchGuard, Nothing, (MavenCentral.GroupId, MavenCentral.ArtifactId, MavenCentral.Version, Path, Request), Response] =
     val groupArtifactVersion = MavenCentral.GroupArtifactVersion(groupId, artifactId, version)
 
     // todo: reduce duplication on error handling
@@ -218,7 +218,7 @@ object App extends ZIOAppDefault:
     string("version").transformOrFailLeft(versionExtractor)(_.toString)
 
   def withVersionAndFile(groupId: MavenCentral.GroupId, artifactId: MavenCentral.ArtifactId, version: MavenCentral.Version, path: Path, request: Request):
-      Handler[BadActor.Store & Extractor.LatestCache & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.TmpDir & Client & Redis & HerokuInference, Nothing, (MavenCentral.GroupId, MavenCentral.ArtifactId, MavenCentral.Version, Path, Request), Response] = {
+      Handler[BadActor.Store & Extractor.LatestCache & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.TmpDir & Client & Redis & HerokuInference & SymbolSearch.SymbolSearchGuard, Nothing, (MavenCentral.GroupId, MavenCentral.ArtifactId, MavenCentral.Version, Path, Request), Response] = {
     if (path.isEmpty)
       withVersion(groupId, artifactId, version, request)
     else
@@ -226,7 +226,7 @@ object App extends ZIOAppDefault:
   }
 
 
-  def index(request: Request): Handler[Redis & HerokuInference & Client & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker, Nothing, Request, Response] =
+  def index(request: Request): Handler[Redis & HerokuInference & Client & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & SymbolSearch.SymbolSearchGuard, Nothing, Request, Response] =
     request.queryParameters.map.keys.filterNot(_ == "groupId").headOption.fold(Response.html(UI.page("javadocs.dev", UI.index)).toHandler):
       query =>
         // todo: rate limit
@@ -409,10 +409,10 @@ object App extends ZIOAppDefault:
       )
 
 
-  val app: Routes[BadActor.Store & Extractor.LatestCache & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.TmpDir & Client & Redis & HerokuInference, Response] =
+  val app: Routes[BadActor.Store & Extractor.LatestCache & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.TmpDir & Client & Redis & HerokuInference & SymbolSearch.SymbolSearchGuard, Response] =
     val mcpRoutes = MCP.mcpServer.statelessRoutes
 
-    val appRoutes = Routes[BadActor.Store & Extractor.LatestCache & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.TmpDir & Client & Redis & HerokuInference, Nothing](
+    val appRoutes = Routes[BadActor.Store & Extractor.LatestCache & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.TmpDir & Client & Redis & HerokuInference & SymbolSearch.SymbolSearchGuard, Nothing](
       Method.GET / Root -> Handler.fromFunctionHandler[Request](index),
       Method.GET / "favicon.ico" -> Handler.fromResource("favicon.ico").orDie,
       Method.GET / "favicon.png" -> Handler.fromResource("favicon.png").orDie,
@@ -567,6 +567,10 @@ object App extends ZIOAppDefault:
     ZLayer.fromZIO:
       ConcurrentMap.empty[MavenCentral.GroupArtifactVersion, Fiber[Nothing, Unit]].map(CrawlerEvictions(_))
 
+  val symbolSearchGuardLayer: ZLayer[Any, Nothing, SymbolSearch.SymbolSearchGuard] =
+    ZLayer.fromZIO:
+      ConcurrentMap.empty[MavenCentral.GroupArtifactVersion, Unit].map(SymbolSearch.SymbolSearchGuard(_))
+
   private def evictCrawlerCache(gav: MavenCentral.GroupArtifactVersion): ZIO[CrawlerEvictions & CrawlerGavLimiter & Extractor.JavadocCache & Extractor.TmpDir, Nothing, Unit] =
     defer:
       val tmpDir = ZIO.serviceWith[Extractor.TmpDir](_.dir).run
@@ -664,7 +668,7 @@ object App extends ZIOAppDefault:
         else
           ZIO.succeed((request, ()))
 
-  val appWithMiddleware: Routes[CrawlerGavLimiter & CrawlerEvictions & BadActor.Store & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.LatestCache & Extractor.TmpDir & Client & Redis & HerokuInference, Response] =
+  val appWithMiddleware: Routes[CrawlerGavLimiter & CrawlerEvictions & BadActor.Store & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.LatestCache & Extractor.TmpDir & Client & Redis & HerokuInference & SymbolSearch.SymbolSearchGuard, Response] =
     app @@ badActorMiddleware @@ crawlerMiddleware @@ crawlerRateLimitMiddleware @@ redirectQueryParams @@ immutableAssetNotModified @@ immutableAssetCacheHeaders @@ Middleware.requestLogging(loggedRequestHeaders = Set(Header.UserAgent))
 
   // todo: i think there is a better way
@@ -802,4 +806,5 @@ object App extends ZIOAppDefault:
       BadActor.live,
       crawlerEvictionsLayer,
       crawlerGavLimiterLayer,
+      symbolSearchGuardLayer,
     )

@@ -23,4 +23,5 @@ object AppTest extends ZIOAppDefault:
       BadActor.live,
       App.crawlerEvictionsLayer,
       App.crawlerGavLimiterLayer,
+      App.symbolSearchGuardLayer,
     )

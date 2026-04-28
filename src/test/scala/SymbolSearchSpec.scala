@@ -17,7 +17,7 @@ object SymbolSearchSpec extends ZIOSpecDefault:
         defer:
           val springai = Extractor.gav("org.springframework.ai", "spring-ai-mcp", "1.0.1")
           val doccontents = Extractor.javadocContents(springai).run
-          SymbolSearch.update(springai.noVersion, doccontents).run
+          SymbolSearch.update(springai, doccontents).run
 
 //          val redis = ZIO.service[Redis].run
 //          redis.keys("*").returning[String].debug.run
@@ -106,13 +106,14 @@ object SymbolSearchSpec extends ZIOSpecDefault:
       Redis.singleNode,
       ZLayer.succeed[CodecSupplier](SymbolSearch.ProtobufCodecSupplier),
       SymbolSearch.herokuInferenceLayer.orElse(MockInference.layer),
+      App.symbolSearchGuardLayer,
     ),
     suite("integration")(
       test("search with real Redis") {
         defer:
           val springai = Extractor.gav("org.springframework.ai", "spring-ai-mcp", "1.0.1")
           val doccontents = Extractor.javadocContents(springai).run
-          SymbolSearch.update(springai.noVersion, doccontents).run
+          SymbolSearch.update(springai, doccontents).run
 
           val notExist = SymbolSearch.search("asdfasdfzxcvzxcv12412421").run
           val fqnMatch = SymbolSearch.search("org.springframework.ai.mcp.AsyncMcpToolCallback").run
@@ -136,5 +137,6 @@ object SymbolSearchSpec extends ZIOSpecDefault:
       App.redisAuthLayer,
       ZLayer.succeed[CodecSupplier](SymbolSearch.ProtobufCodecSupplier),
       SymbolSearch.herokuInferenceLayer.orElse(MockInference.layer),
+      App.symbolSearchGuardLayer,
     ) @@ TestAspect.ifEnvSet("REDIS_URL") @@ TestAspect.timeout(10.seconds),
   ) @@ TestAspect.withLiveSystem @@ TestAspect.sequential

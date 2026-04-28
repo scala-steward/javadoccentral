@@ -1,5 +1,6 @@
 import com.jamesward.zio_mavencentral.MavenCentral
 import zio.*
+import zio.concurrent.ConcurrentMap
 import zio.direct.*
 import zio.http.*
 import zio.http.Header.Authorization
@@ -13,6 +14,9 @@ import zio.stream.ZStream
 object SymbolSearch:
 
   val groupArtifactsKey = "_groupArtifacts"
+  val gavCacheKey = "_gavCache"
+
+  case class SymbolSearchGuard(active: ConcurrentMap[MavenCentral.GroupArtifactVersion, Unit])
 
   case class InferenceError(message: String)
   case class SearchError(message: String)
@@ -110,7 +114,7 @@ object SymbolSearch:
       val workaroundForMarkdownContent = choice.message.content.replace("```json", "").replace("```", "").trim
       workaroundForMarkdownContent.fromJson[Set[MavenCentral.GroupArtifact]].getOrElse(Set.empty)
 
-  def search(symbol: String): ZIO[Redis & HerokuInference & Scope & Client & Extractor.FetchBlocker & Extractor.JavadocCache, SearchError, Set[MavenCentral.GroupArtifact]] =
+  def search(symbol: String): ZIO[Redis & HerokuInference & Scope & Client & Extractor.FetchBlocker & Extractor.JavadocCache & SymbolSearchGuard, SearchError, Set[MavenCentral.GroupArtifact]] =
     defer:
       val redis = ZIO.service[Redis].run
 
@@ -175,12 +179,30 @@ object SymbolSearch:
       val redis = ZIO.service[Redis].run
       redis.sMembers(groupArtifactsKey).returning[MavenCentral.GroupArtifact].run.toSet
 
-  def update(groupArtifact: MavenCentral.GroupArtifact, symbols: Set[Extractor.Content]): ZIO[Redis, Throwable, Unit] =
+  def update(groupArtifactVersion: MavenCentral.GroupArtifactVersion, symbols: Set[Extractor.Content]): ZIO[Redis & SymbolSearchGuard, Throwable, Unit] =
     defer:
       val redis = ZIO.service[Redis].run
-      ZIO.foreachPar(symbols):
-        symbol =>
-          redis.sAdd(symbol.fqn, groupArtifact)
-      .unit
-      .run
-      redis.sAdd(groupArtifactsKey, groupArtifact).unit.run
+      val guard = ZIO.service[SymbolSearchGuard].run.active
+      val groupArtifact = groupArtifactVersion.noVersion
+      val gaKey = groupArtifactToString(groupArtifact)
+      val version = groupArtifactVersion.version.toString
+
+      val cached = redis.hGet(gavCacheKey, gaKey).returning[String].run
+      if cached.contains(version) then
+        ZIO.unit.run
+      else
+        val existing = guard.putIfAbsent(groupArtifactVersion, ()).run
+        existing match
+          case Some(_) =>
+            // another fiber is already indexing this GAV — skip
+            ZIO.unit.run
+          case None =>
+            val work = defer:
+              ZIO.logInfo(s"Updating symbol index: $groupArtifactVersion symbols=${symbols.size}").run
+              ZIO.foreachPar(symbols): symbol =>
+                redis.sAdd(symbol.fqn, groupArtifact)
+              .withParallelism(50).unit.run
+              redis.sAdd(groupArtifactsKey, groupArtifact).unit.run
+              redis.hSet(gavCacheKey, gaKey -> version).unit.run
+              ZIO.logInfo(s"Updated symbol index: $groupArtifactVersion symbols=${symbols.size}").run
+            work.ensuring(guard.remove(groupArtifactVersion)).run
