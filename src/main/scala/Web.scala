@@ -396,21 +396,28 @@ object Web:
   val app: Routes[BadActor.Store & Extractor.LatestCache & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.TmpDir & Client & Redis & HerokuInference & SymbolSearch.SymbolSearchGuard, Response] =
     val mcpRoutes = MCP.mcpServer.statelessRoutes
 
+    // All read endpoints respond to both GET and HEAD. Per RFC 9110, HEAD must
+    // behave exactly like GET but with no response body. Using `GET #| HEAD`
+    // registers the handler under both methods in the route tree; the
+    // `headStripBody` middleware empties the body (while preserving the
+    // Content-Length header) for HEAD responses.
+    val getOrHead: Method = Method.GET #| Method.HEAD
+
     val appRoutes = Routes[BadActor.Store & Extractor.LatestCache & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.TmpDir & Client & Redis & HerokuInference & SymbolSearch.SymbolSearchGuard, Nothing](
-      Method.GET / Root -> Handler.fromFunctionHandler[Request](index),
-      Method.GET / "favicon.ico" -> Handler.fromResource("favicon.ico").orDie,
-      Method.GET / "favicon.png" -> Handler.fromResource("favicon.png").orDie,
-      Method.GET / "robots.txt" -> robots.toHandler,
-      Method.GET / "llms.txt" -> llmsTxt,
-      Method.GET / "llms" / groupId -> Handler.fromFunctionHandler[(MavenCentral.GroupId, Request)](llmsGroup),
-      Method.GET / "llms" / groupId / artifactId -> Handler.fromFunctionHandler[(MavenCentral.GroupId, MavenCentral.ArtifactId, Request)](llmsArtifact),
-      Method.GET / "llms" / groupId / artifactId / version -> Handler.fromFunctionHandler[(MavenCentral.GroupId, MavenCentral.ArtifactId, MavenCentral.Version, Request)](llmsVersion),
-      Method.GET / "sitemap.xml" -> sitemapIndex,
-      Method.GET / "sitemap" / groupId -> Handler.fromFunctionHandler[(MavenCentral.GroupId, Request)](sitemapGroup),
-      Method.GET / ".well-known" / trailing -> Handler.notFound,
-      Method.GET / groupId -> Handler.fromFunctionHandler[(MavenCentral.GroupId, Request)](withGroupId),
-      Method.GET / groupId / artifactId -> Handler.fromFunctionHandler[(MavenCentral.GroupId, MavenCentral.ArtifactId, Request)](withArtifactId),
-      Method.GET / groupId / artifactId / version / trailing -> Handler.fromFunctionHandler[(MavenCentral.GroupId, MavenCentral.ArtifactId, MavenCentral.Version, Path, Request)](withVersionAndFile),
+      getOrHead / Root -> Handler.fromFunctionHandler[Request](index),
+      getOrHead / "favicon.ico" -> Handler.fromResource("favicon.ico").orDie,
+      getOrHead / "favicon.png" -> Handler.fromResource("favicon.png").orDie,
+      getOrHead / "robots.txt" -> robots.toHandler,
+      getOrHead / "llms.txt" -> llmsTxt,
+      getOrHead / "llms" / groupId -> Handler.fromFunctionHandler[(MavenCentral.GroupId, Request)](llmsGroup),
+      getOrHead / "llms" / groupId / artifactId -> Handler.fromFunctionHandler[(MavenCentral.GroupId, MavenCentral.ArtifactId, Request)](llmsArtifact),
+      getOrHead / "llms" / groupId / artifactId / version -> Handler.fromFunctionHandler[(MavenCentral.GroupId, MavenCentral.ArtifactId, MavenCentral.Version, Request)](llmsVersion),
+      getOrHead / "sitemap.xml" -> sitemapIndex,
+      getOrHead / "sitemap" / groupId -> Handler.fromFunctionHandler[(MavenCentral.GroupId, Request)](sitemapGroup),
+      getOrHead / ".well-known" / trailing -> Handler.notFound,
+      getOrHead / groupId -> Handler.fromFunctionHandler[(MavenCentral.GroupId, Request)](withGroupId),
+      getOrHead / groupId / artifactId -> Handler.fromFunctionHandler[(MavenCentral.GroupId, MavenCentral.ArtifactId, Request)](withArtifactId),
+      getOrHead / groupId / artifactId / version / trailing -> Handler.fromFunctionHandler[(MavenCentral.GroupId, MavenCentral.ArtifactId, MavenCentral.Version, Path, Request)](withVersionAndFile),
     )
 
     mcpRoutes ++ appRoutes
@@ -603,7 +610,7 @@ object Web:
 
   private def isImmutableAssetPath(request: Request): Boolean =
     val segs = request.path.segments.toList
-    request.method == Method.GET
+    (request.method == Method.GET || request.method == Method.HEAD)
       && segs.length >= 4
       && segs(2) != "latest"
       && MavenCentral.Version.unapply(segs(2)).isDefined
@@ -648,5 +655,30 @@ object Web:
         else
           ZIO.succeed((request, ()))
 
+  // HEAD support: per RFC 9110, HEAD must behave exactly like GET but with no
+  // response body. We enable `Server.Config.generateHeadRoutes = true` (see
+  // App.scala) so that zio-http's routing layer dispatches HEAD requests to
+  // matching GET handlers. The GET handler still produces a response with a
+  // full body, so this middleware strips the body for HEAD responses while
+  // preserving the Content-Length the client would have seen for GET. The
+  // netty encoder preserves an explicit Content-Length header when the request
+  // method is HEAD (see NettyResponseEncoder / zio-http issue #3080).
+  private val headStripBody: HandlerAspect[Any, Unit] =
+    HandlerAspect.interceptHandlerStateful(
+      Handler.fromFunction[Request]: request =>
+        (request.method == Method.HEAD, (request, ()))
+    )(
+      Handler.fromFunction[(Boolean, Response)]:
+        case (true, response) =>
+          val withContentLength =
+            if response.headers.contains(Header.ContentLength.name) then response
+            else
+              response.body.knownContentLength match
+                case Some(len) => response.addHeader(Header.ContentLength(len))
+                case None => response
+          withContentLength.copy(body = Body.empty)
+        case (false, response) => response
+    )
+
   val appWithMiddleware: Routes[CrawlerGavLimiter & CrawlerEvictions & BadActor.Store & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.LatestCache & Extractor.TmpDir & Client & Redis & HerokuInference & SymbolSearch.SymbolSearchGuard, Response] =
-    app @@ badActorMiddleware @@ crawlerMiddleware @@ crawlerRateLimitMiddleware @@ redirectQueryParams @@ immutableAssetNotModified @@ immutableAssetCacheHeaders @@ Middleware.requestLogging(loggedRequestHeaders = Set(Header.UserAgent))
+    app @@ badActorMiddleware @@ crawlerMiddleware @@ crawlerRateLimitMiddleware @@ redirectQueryParams @@ immutableAssetNotModified @@ immutableAssetCacheHeaders @@ Middleware.requestLogging(loggedRequestHeaders = Set(Header.UserAgent)) @@ headStripBody

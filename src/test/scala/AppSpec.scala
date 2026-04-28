@@ -96,6 +96,41 @@ object AppSpec extends ZIOSpecDefault:
           body.contains("ArrayTreeNode.html"),
           filePage.status.isSuccess,
         )
+    , test("HEAD behaves like GET but returns no body"):
+      val forwardedForHeader = Header.Custom("X-Forwarded-For", "192.168.1.100")
+      val assetPath = Path.root / "org.webjars" / "webjars-locator-core" / "0.52" / "org" / "webjars" / "package-summary.html"
+      defer:
+        val getResp = Web.appWithMiddleware.runZIO(
+          Request.get(URL(assetPath)).addHeader(forwardedForHeader)
+        ).run
+        val headResp = Web.appWithMiddleware.runZIO(
+          Request.head(URL(assetPath)).addHeader(forwardedForHeader)
+        ).run
+        val getBody = getResp.body.asString.run
+        val headBody = headResp.body.asString.run
+        assertTrue(
+          getResp.status.isSuccess,
+          headResp.status == getResp.status,
+          headBody.isEmpty,
+          getBody.nonEmpty,
+          // HEAD should expose the same Content-Length as GET would
+          headResp.header(Header.ContentLength).map(_.length).contains(getBody.length.toLong),
+          // Other significant headers should match
+          headResp.header(Header.ContentType).map(_.renderedValue) == getResp.header(Header.ContentType).map(_.renderedValue),
+          headResp.header(Header.ETag).map(_.renderedValue) == getResp.header(Header.ETag).map(_.renderedValue),
+          headResp.header(Header.CacheControl).map(_.renderedValue) == getResp.header(Header.CacheControl).map(_.renderedValue),
+        )
+    , test("HEAD for unknown path returns 404 like GET (no body)"):
+      val forwardedForHeader = Header.Custom("X-Forwarded-For", "192.168.1.100")
+      defer:
+        val headResp = Web.appWithMiddleware.runZIO(
+          Request.head(URL(Path.root / "asdfqwerzzxcv")).addHeader(forwardedForHeader)
+        ).run
+        val headBody = headResp.body.asString.run
+        assertTrue(
+          headResp.status == Status.NotFound,
+          headBody.isEmpty,
+        )
     , test("rate limit bad actors"):
       defer:
         val forwardedBadActorHeader = Header.Custom("X-Forwarded-For", "192.168.1.100")
