@@ -57,7 +57,7 @@ object McpSpec extends ZIOSpecDefault:
   private def javadocContentListTest(label: String, gid: String, aid: String, ver: String) =
     test(s"get_javadoc_content_list returns non-empty contents for $label"):
       for
-        port   <- Server.install(App.appWithMiddleware)
+        port   <- Server.install(Web.appWithMiddleware)
         result <- withClient(port): client =>
           callTool(client, "get_javadoc_content_list", java.util.Map.of("groupId", gid, "artifactId", aid, "version", ver))
       yield
@@ -67,7 +67,7 @@ object McpSpec extends ZIOSpecDefault:
   private def javadocSymbolContentsTest(label: String, gid: String, aid: String, ver: String) =
     test(s"get_javadoc_symbol_contents works for $label"):
       for
-        port   <- Server.install(App.appWithMiddleware)
+        port   <- Server.install(Web.appWithMiddleware)
         result <- withClient(port): client =>
           val contentList = resultText(callTool(client, "get_javadoc_content_list", java.util.Map.of("groupId", gid, "artifactId", aid, "version", ver)))
           val linkPattern = """"link"\s*:\s*"([^"]+)"""".r
@@ -80,7 +80,7 @@ object McpSpec extends ZIOSpecDefault:
   private def sourceContentsTest(label: String, gid: String, aid: String, ver: String, ext: String) =
     test(s"list and get source contents for $label"):
       for
-        port   <- Server.install(App.appWithMiddleware)
+        port   <- Server.install(Web.appWithMiddleware)
         result <- withClient(port): client =>
           val sourceList = resultText(callTool(client, "list_source_contents", java.util.Map.of("groupId", gid, "artifactId", aid, "version", ver)))
           assertTrue(sourceList.contains(ext) && sourceList != "[]") // assert inline to fail fast
@@ -97,7 +97,7 @@ object McpSpec extends ZIOSpecDefault:
       // --- tools/list validation ---
       test("tools/list returns all tools with valid schemas"):
         for
-          port   <- Server.install(App.appWithMiddleware)
+          port   <- Server.install(Web.appWithMiddleware)
           tools  <- withClient(port): client =>
             client.listTools().tools()
         yield
@@ -121,7 +121,7 @@ object McpSpec extends ZIOSpecDefault:
       // --- get_latest_version ---
       test("get_latest_version returns a version"):
         for
-          port   <- Server.install(App.appWithMiddleware)
+          port   <- Server.install(Web.appWithMiddleware)
           result <- withClient(port): client =>
             callTool(client, "get_latest_version", java.util.Map.of("groupId", javaGroupId, "artifactId", javaArtifactId))
         yield
@@ -130,7 +130,7 @@ object McpSpec extends ZIOSpecDefault:
       ,
       test("get_latest_version errors for nonexistent artifact"):
         for
-          port   <- Server.install(App.appWithMiddleware)
+          port   <- Server.install(Web.appWithMiddleware)
           result <- withClient(port): client =>
             callTool(client, "get_latest_version", java.util.Map.of("groupId", "com.nonexistent.fake", "artifactId", "does-not-exist"))
         yield assertIsError(result)
@@ -142,7 +142,7 @@ object McpSpec extends ZIOSpecDefault:
       javadocContentListTest("kotlin", kotlinGroupId, kotlinArtifactId, kotlinVersion),
       test("get_javadoc_content_list errors for nonexistent version"):
         for
-          port   <- Server.install(App.appWithMiddleware)
+          port   <- Server.install(Web.appWithMiddleware)
           result <- withClient(port): client =>
             callTool(client, "get_javadoc_content_list", java.util.Map.of("groupId", javaGroupId, "artifactId", javaArtifactId, "version", "0.0.0-does-not-exist"))
         yield assertIsError(result)
@@ -154,7 +154,7 @@ object McpSpec extends ZIOSpecDefault:
       javadocSymbolContentsTest("kotlin", kotlinGroupId, kotlinArtifactId, kotlinVersion),
       test("get_javadoc_symbol_contents errors for nonexistent link"):
         for
-          port   <- Server.install(App.appWithMiddleware)
+          port   <- Server.install(Web.appWithMiddleware)
           result <- withClient(port): client =>
             callTool(client, "get_javadoc_symbol_contents", java.util.Map.of("groupId", javaGroupId, "artifactId", javaArtifactId, "version", javaVersion, "link", "nonexistent/FakeClass.html"))
         yield assertIsError(result)
@@ -166,14 +166,14 @@ object McpSpec extends ZIOSpecDefault:
       sourceContentsTest("kotlin", kotlinGroupId, kotlinArtifactId, kotlinVersion, ".kt"),
       test("list_source_contents errors for nonexistent artifact"):
         for
-          port   <- Server.install(App.appWithMiddleware)
+          port   <- Server.install(Web.appWithMiddleware)
           result <- withClient(port): client =>
             callTool(client, "list_source_contents", java.util.Map.of("groupId", "com.nonexistent.fake", "artifactId", "does-not-exist", "version", "1.0.0"))
         yield assertIsError(result)
       ,
       test("get_source_contents errors for nonexistent file"):
         for
-          port   <- Server.install(App.appWithMiddleware)
+          port   <- Server.install(Web.appWithMiddleware)
           result <- withClient(port): client =>
             callTool(client, "get_source_contents", java.util.Map.of("groupId", javaGroupId, "artifactId", javaArtifactId, "version", javaVersion, "link", "com/fake/NonExistent.java"))
         yield assertIsError(result)
@@ -182,7 +182,7 @@ object McpSpec extends ZIOSpecDefault:
       // --- symbol_to_artifact ---
       test("symbol_to_artifact returns matching artifacts with groupId and artifactId"):
         for
-          port   <- Server.install(App.appWithMiddleware)
+          port   <- Server.install(Web.appWithMiddleware)
           result <- withClient(port): client =>
             callTool(client, "symbol_to_artifact", java.util.Map.of[String, Object]("query", "zio.cache.Cache"))
         yield
@@ -205,7 +205,7 @@ object McpSpec extends ZIOSpecDefault:
       ZLayer.succeed[CodecSupplier](SymbolSearch.ProtobufCodecSupplier),
       SymbolSearch.herokuInferenceLayer.orElse(MockInference.layer),
       BadActor.live,
-      App.crawlerEvictionsLayer,
-      App.crawlerGavLimiterLayer,
+      Web.crawlerEvictionsLayer,
+      Web.crawlerGavLimiterLayer,
       App.symbolSearchGuardLayer,
     ) @@ withLiveClock @@ timeout(3.minutes) @@ sequential

@@ -14,22 +14,22 @@ object AppSpec extends ZIOSpecDefault:
       val forwardedForHeader = Header.Custom("X-Forwarded-For", "192.168.1.100")
 
       defer:
-        val groupIdResp = App.appWithMiddleware.runZIO(Request.get(URL(Path.root, queryParams = QueryParams("groupId" -> "com.jamesward"))).addHeader(forwardedForHeader)).run
-        val artifactIdResp = App.appWithMiddleware.runZIO(Request.get(URL(Path.root / "com.jamesward", queryParams = QueryParams("artifactId" -> "travis-central-test"))).addHeader(forwardedForHeader)).run
-        val versionResp = App.appWithMiddleware.runZIO(Request.get(URL(Path.root / "com.jamesward" / "travis-central-test", queryParams = QueryParams("version" -> "0.0.15"))).addHeader(forwardedForHeader)).run
-        val latest = App.appWithMiddleware.runZIO(Request.get(URL(Path.root / "org.webjars" / "jquery" / "latest")).addHeader(forwardedForHeader)).run
+        val groupIdResp = Web.appWithMiddleware.runZIO(Request.get(URL(Path.root, queryParams = QueryParams("groupId" -> "com.jamesward"))).addHeader(forwardedForHeader)).run
+        val artifactIdResp = Web.appWithMiddleware.runZIO(Request.get(URL(Path.root / "com.jamesward", queryParams = QueryParams("artifactId" -> "travis-central-test"))).addHeader(forwardedForHeader)).run
+        val versionResp = Web.appWithMiddleware.runZIO(Request.get(URL(Path.root / "com.jamesward" / "travis-central-test", queryParams = QueryParams("version" -> "0.0.15"))).addHeader(forwardedForHeader)).run
+        val latest = Web.appWithMiddleware.runZIO(Request.get(URL(Path.root / "org.webjars" / "jquery" / "latest")).addHeader(forwardedForHeader)).run
 
-        val groupIdRedir = App.appWithMiddleware.runZIO(Request.get(URL((Path.root / "com.jamesward").addTrailingSlash)).addHeader(forwardedForHeader)).run
-        val artifactIdRedir = App.appWithMiddleware.runZIO(Request.get(URL((Path.root / "com.jamesward" / "travis-central-test").addTrailingSlash)).addHeader(forwardedForHeader)).run
+        val groupIdRedir = Web.appWithMiddleware.runZIO(Request.get(URL((Path.root / "com.jamesward").addTrailingSlash)).addHeader(forwardedForHeader)).run
+        val artifactIdRedir = Web.appWithMiddleware.runZIO(Request.get(URL((Path.root / "com.jamesward" / "travis-central-test").addTrailingSlash)).addHeader(forwardedForHeader)).run
 
-        val indexPath = App.appWithMiddleware.runZIO(Request.get(URL(Path.root / "org.webjars" / "webjars-locator-core" / "0.52" / "index.html")).addHeader(forwardedForHeader)).run
-        val filePath = App.appWithMiddleware.runZIO(Request.get(URL(Path.root / "org.webjars" / "webjars-locator-core" / "0.52" / "org" / "webjars" / "package-summary.html")).addHeader(forwardedForHeader)).run
-        val notFoundFilePath = App.appWithMiddleware.runZIO(Request.get(URL(Path.root / "org.webjars" / "webjars-locator-core" / "0.52" / "asdf")).addHeader(forwardedForHeader)).run
-        val notFoundGroupId = App.appWithMiddleware.runZIO(Request.get(URL(Path.root / "asdfqwerzzxcv")).addHeader(forwardedForHeader)).run
+        val indexPath = Web.appWithMiddleware.runZIO(Request.get(URL(Path.root / "org.webjars" / "webjars-locator-core" / "0.52" / "index.html")).addHeader(forwardedForHeader)).run
+        val filePath = Web.appWithMiddleware.runZIO(Request.get(URL(Path.root / "org.webjars" / "webjars-locator-core" / "0.52" / "org" / "webjars" / "package-summary.html")).addHeader(forwardedForHeader)).run
+        val notFoundFilePath = Web.appWithMiddleware.runZIO(Request.get(URL(Path.root / "org.webjars" / "webjars-locator-core" / "0.52" / "asdf")).addHeader(forwardedForHeader)).run
+        val notFoundGroupId = Web.appWithMiddleware.runZIO(Request.get(URL(Path.root / "asdfqwerzzxcv")).addHeader(forwardedForHeader)).run
 
         assertTrue(
-          App.appWithMiddleware.runZIO(Request.get(URL(Path.empty)).addHeader(forwardedForHeader)).run.status.isSuccess,
-          App.appWithMiddleware.runZIO(Request.get(URL(Path.root)).addHeader(forwardedForHeader)).run.status.isSuccess,
+          Web.appWithMiddleware.runZIO(Request.get(URL(Path.empty)).addHeader(forwardedForHeader)).run.status.isSuccess,
+          Web.appWithMiddleware.runZIO(Request.get(URL(Path.root)).addHeader(forwardedForHeader)).run.status.isSuccess,
           groupIdResp.status.isRedirection,
           groupIdResp.headers.get(Header.Location).exists(_.url.path == Path.decode("/com.jamesward")),
           artifactIdResp.status.isRedirection,
@@ -62,12 +62,12 @@ object AppSpec extends ZIOSpecDefault:
       // we never try to download it, returning 304 before any route/download runs.
       val neverDownloadedPath = Path.root / "com.example.nonexistent" / "no-such-artifact" / "99.99.99" / "index.html"
       defer:
-        val withIfNoneMatch = App.appWithMiddleware.runZIO(
+        val withIfNoneMatch = Web.appWithMiddleware.runZIO(
           Request.get(URL(neverDownloadedPath))
             .addHeader(forwardedForHeader)
             .addHeader(Header.IfNoneMatch.Any)
         ).run
-        val withIfModifiedSince = App.appWithMiddleware.runZIO(
+        val withIfModifiedSince = Web.appWithMiddleware.runZIO(
           Request.get(URL(neverDownloadedPath))
             .addHeader(forwardedForHeader)
             .addHeader(Header.IfModifiedSince(java.time.ZonedDateTime.ofInstant(java.time.Instant.EPOCH, java.time.ZoneOffset.UTC)))
@@ -81,12 +81,12 @@ object AppSpec extends ZIOSpecDefault:
     , test("version page for javadoc without index.html"):
       val forwardedForHeader = Header.Custom("X-Forwarded-For", "192.168.1.100")
       defer:
-        val versionPage = App.appWithMiddleware.runZIO(
+        val versionPage = Web.appWithMiddleware.runZIO(
           Request.get(URL(Path.root / "tools.jackson.core" / "jackson-core" / "3.1.1"))
             .addHeader(forwardedForHeader)
             .addHeader(Header.Accept(MediaType.text.html))
         ).run
-        val filePage = App.appWithMiddleware.runZIO(
+        val filePage = Web.appWithMiddleware.runZIO(
           Request.get(URL(Path.root / "tools.jackson.core" / "jackson-core" / "3.1.1" / "tools.jackson.core" / "tools" / "jackson" / "core" / "tree" / "ArrayTreeNode.html"))
             .addHeader(forwardedForHeader)
         ).run
@@ -103,14 +103,14 @@ object AppSpec extends ZIOSpecDefault:
         // Make 5 requests ending in .php - these should return not found
         val phpResponses = ZIO.foreach(1 to 5): i =>
           val request = Request.get(URL(Path.root / s"test$i.php")).addHeader(forwardedBadActorHeader)
-          App.appWithMiddleware.runZIO(request)
+          Web.appWithMiddleware.runZIO(request)
         .run
 
         // The 6th request should trigger the slow gibberish response
         val forwardedBadActorMultipleHeader = Header.Custom("X-Forwarded-For", "192.168.1.101,192.168.1.100")
         val slowRequest = Request.get(URL(Path.root / "trigger.php")).addHeader(forwardedBadActorMultipleHeader)
 
-        val slowResponse = App.appWithMiddleware.runZIO(slowRequest).run
+        val slowResponse = Web.appWithMiddleware.runZIO(slowRequest).run
 
         val bodyFork = slowResponse.body.asString.timed.fork.run
 
@@ -121,7 +121,7 @@ object AppSpec extends ZIOSpecDefault:
 
         val forwardedGoodActorHeader = Header.Custom("X-Forwarded-For", "192.168.1.101")
         val goodActorRequest = Request.get(URL(Path.root)).addHeader(forwardedGoodActorHeader)
-        val goodActorResponse = App.appWithMiddleware.runZIO(goodActorRequest).run
+        val goodActorResponse = Web.appWithMiddleware.runZIO(goodActorRequest).run
 
         assertTrue(
           phpResponses.forall(_.status == Status.NotFound),
@@ -132,7 +132,7 @@ object AppSpec extends ZIOSpecDefault:
         )
     , test("gibberish"):
       defer:
-        val gibberishFromStreamFork = App.gibberishStream.runCollect.timed.fork.run
+        val gibberishFromStreamFork = Web.gibberishStream.runCollect.timed.fork.run
         // we can't just move the clock once as that won't trigger the interrupt
         TestClock.adjust(1.second).forever.fork.run
         val (duration, gibberish) = gibberishFromStreamFork.join.run
@@ -148,11 +148,11 @@ object AppSpec extends ZIOSpecDefault:
       val gav1File = Path.root / "org.webjars" / "webjars-locator-core" / "0.52" / "org" / "webjars" / "package-summary.html"
       val gav2 = Path.root / "org.webjars" / "jquery" / "3.7.1" / "index.html"
       defer:
-        val firstGav = App.appWithMiddleware.runZIO(Request.get(URL(gav1)).addHeader(forwardedForHeader).addHeader(bot)).run
-        val sameGavOtherFile = App.appWithMiddleware.runZIO(Request.get(URL(gav1File)).addHeader(forwardedForHeader).addHeader(bot)).run
-        val otherGav = App.appWithMiddleware.runZIO(Request.get(URL(gav2)).addHeader(forwardedForHeader).addHeader(bot)).run
+        val firstGav = Web.appWithMiddleware.runZIO(Request.get(URL(gav1)).addHeader(forwardedForHeader).addHeader(bot)).run
+        val sameGavOtherFile = Web.appWithMiddleware.runZIO(Request.get(URL(gav1File)).addHeader(forwardedForHeader).addHeader(bot)).run
+        val otherGav = Web.appWithMiddleware.runZIO(Request.get(URL(gav2)).addHeader(forwardedForHeader).addHeader(bot)).run
         // non-crawler bypasses the limiter entirely
-        val nonCrawlerSameGav = App.appWithMiddleware.runZIO(Request.get(URL(gav2)).addHeader(forwardedForHeader)).run
+        val nonCrawlerSameGav = Web.appWithMiddleware.runZIO(Request.get(URL(gav2)).addHeader(forwardedForHeader)).run
 
         assertTrue(
           firstGav.status == Status.Ok,
@@ -176,7 +176,7 @@ object AppSpec extends ZIOSpecDefault:
     ZLayer.succeed[CodecSupplier](SymbolSearch.ProtobufCodecSupplier),
     SymbolSearch.herokuInferenceLayer.orElse(MockInference.layer),
     BadActor.live,
-    App.crawlerEvictionsLayer,
-      App.crawlerGavLimiterLayer,
+    Web.crawlerEvictionsLayer,
+      Web.crawlerGavLimiterLayer,
       App.symbolSearchGuardLayer,
   ) @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom @@ TestAspect.withLiveSystem @@ TestAspect.sequential

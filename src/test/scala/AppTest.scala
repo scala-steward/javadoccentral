@@ -6,7 +6,7 @@ import zio.redis.{CodecSupplier, Redis}
 object AppTest extends ZIOAppDefault:
 
   def run =
-    Server.serve(App.appWithMiddleware).provide(
+    Server.serve(Web.appWithMiddleware).provide(
       App.server,
       Client.default,
       Scope.default,
@@ -21,7 +21,7 @@ object AppTest extends ZIOAppDefault:
       ZLayer.succeed[CodecSupplier](SymbolSearch.ProtobufCodecSupplier),
       SymbolSearch.herokuInferenceLayer.orElse(MockInference.layer),
       BadActor.live,
-      App.crawlerEvictionsLayer,
-      App.crawlerGavLimiterLayer,
+      Web.crawlerEvictionsLayer,
+      Web.crawlerGavLimiterLayer,
       App.symbolSearchGuardLayer,
     )
