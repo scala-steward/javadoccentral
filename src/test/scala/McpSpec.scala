@@ -197,6 +197,8 @@ object McpSpec extends ZIOSpecDefault:
       App.blockerLayer,
       App.sourcesBlockerLayer,
       App.latestCacheLayer,
+      App.javadocDiskCoordinatorLayer,
+      App.sourcesDiskCoordinatorLayer,
       App.javadocCacheLayer,
       App.sourcesCacheLayer,
       App.tmpDirLayer,
@@ -205,7 +207,6 @@ object McpSpec extends ZIOSpecDefault:
       ZLayer.succeed[CodecSupplier](SymbolSearch.ProtobufCodecSupplier),
       SymbolSearch.herokuInferenceLayer.orElse(MockInference.layer),
       BadActor.live,
-      Web.crawlerEvictionsLayer,
       Web.crawlerGavLimiterLayer,
       App.symbolSearchGuardLayer,
     ) @@ withLiveClock @@ timeout(3.minutes) @@ sequential

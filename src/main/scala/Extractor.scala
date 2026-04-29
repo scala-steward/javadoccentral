@@ -7,10 +7,11 @@ import zio.concurrent.ConcurrentMap
 import zio.direct.*
 import zio.http.{Client, URL}
 import zio.prelude.data.Optional.AllValuesAreNullable
-import zio.{Promise, Scope, ZIO}
+import zio.{Clock, Duration, Promise, Ref, Scope, Semaphore, ZIO}
 
 import java.io.File
 import java.nio.file.{Files, Path}
+import java.time.Instant
 import scala.jdk.CollectionConverters.*
 import scala.jdk.OptionConverters.*
 
@@ -26,10 +27,155 @@ object Extractor:
   case class Content(link: String, external: Boolean, fqn: String, `type`: String, kind: String, extra: String)
 
   case class LatestCache(cache: Cache[GroupArtifact, GroupIdOrArtifactIdNotFoundError | LatestNotFound, Version])
-  case class JavadocCache(cache: Cache[GroupArtifactVersion, NotFoundError, File])
-  case class SourcesCache(cache: Cache[GroupArtifactVersion, NotFoundError, File])
+
+  /**
+   * Per-GAV last-access timestamps and mutual-exclusion locks used to
+   * coordinate disk-eviction with concurrent fetches for an extracted
+   * directory.
+   *
+   * `lastAccess` records the last time a GAV was successfully served so the
+   * janitor can identify inactive entries.
+   *
+   * `locks` serializes the eviction path (invalidate + delete) against the
+   * download/return path for a given GAV. Readers that have already obtained
+   * a `File` reference and returned from the Lookup do not hold the lock;
+   * the janitor relies on a grace period to let any such in-flight readers
+   * finish before the directory is deleted.
+   */
+  case class DiskCacheCoordinator(
+    lastAccess: ConcurrentMap[GroupArtifactVersion, Ref[Instant]],
+    locks: ConcurrentMap[GroupArtifactVersion, Semaphore],
+  ):
+    // Obtains (or creates) the per-GAV semaphore.
+    def lockFor(gav: GroupArtifactVersion): ZIO[Any, Nothing, Semaphore] =
+      defer:
+        locks.get(gav).run match
+          case Some(sem) => sem
+          case None =>
+            val fresh = Semaphore.make(1).run
+            locks.putIfAbsent(gav, fresh).run match
+              case Some(existing) => existing
+              case None => fresh
+
+    // Records a successful access to this GAV.
+    def touch(gav: GroupArtifactVersion): ZIO[Any, Nothing, Unit] =
+      defer:
+        val now = Clock.instant.run
+        lastAccess.get(gav).run match
+          case Some(ref) =>
+            ref.set(now).run
+          case None =>
+            val ref = Ref.make(now).run
+            lastAccess.putIfAbsent(gav, ref).run match
+              case Some(existing) => existing.set(now).run
+              case None => ()
+
+    // Forgets all bookkeeping for a GAV. Called by the janitor once the
+    // directory has been deleted.
+    def forget(gav: GroupArtifactVersion): ZIO[Any, Nothing, Unit] =
+      defer:
+        lastAccess.remove(gav).run
+        locks.remove(gav).run
+        ()
+
+  object DiskCacheCoordinator:
+    val make: ZIO[Any, Nothing, DiskCacheCoordinator] =
+      defer:
+        val lastAccess = ConcurrentMap.empty[GroupArtifactVersion, Ref[Instant]].run
+        val locks = ConcurrentMap.empty[GroupArtifactVersion, Semaphore].run
+        DiskCacheCoordinator(lastAccess, locks)
+
+  // Separate wrapper types so ZIO environment can distinguish the javadoc
+  // coordinator from the sources coordinator (they manage different dirs).
+  case class JavadocDiskCoordinator(value: DiskCacheCoordinator)
+  case class SourcesDiskCoordinator(value: DiskCacheCoordinator)
+
+  case class JavadocCache(
+    cache: Cache[GroupArtifactVersion, NotFoundError, File],
+    coordinator: DiskCacheCoordinator,
+  ):
+    // cache.get + access-touch. Use this instead of `cache.get` directly so
+    // that cache hits also update the access tracker.
+    def getDir(gav: GroupArtifactVersion): ZIO[Any, NotFoundError, File] =
+      defer:
+        val dir = cache.get(gav).run
+        coordinator.touch(gav).run
+        dir
+
+  case class SourcesCache(
+    cache: Cache[GroupArtifactVersion, NotFoundError, File],
+    coordinator: DiskCacheCoordinator,
+  ):
+    def getDir(gav: GroupArtifactVersion): ZIO[Any, NotFoundError, File] =
+      defer:
+        val dir = cache.get(gav).run
+        coordinator.touch(gav).run
+        dir
+
   case class FetchBlocker(blocker: ConcurrentMap[GroupArtifactVersion, Promise[Nothing, Unit]])
   case class FetchSourcesBlocker(blocker: ConcurrentMap[GroupArtifactVersion, Promise[Nothing, Unit]])
+
+  // Recursively deletes a directory tree. Safe to call on a non-existent path.
+  private def deleteDirBlocking(dir: File): Unit =
+    if dir.isDirectory then
+      val children = dir.listFiles
+      if children != null then
+        var i = 0
+        while i < children.length do
+          val c = children(i)
+          if c != null then deleteDirBlocking(c)
+          i += 1
+    dir.delete()
+    ()
+
+  /**
+   * Evicts a single GAV from the given zio-cache and deletes its on-disk
+   * directory, coordinating with concurrent fetches via the coordinator's
+   * per-GAV semaphore.
+   *
+   * A fetch that is mid-download holds the same semaphore, so this will
+   * block until the download completes. A fetch that has already returned
+   * a `File` to a reader does not hold the semaphore — the `gracePeriod`
+   * provides a window for any such in-flight read to finish before the
+   * directory is deleted.
+   *
+   * During the grace period the cache entry is already invalidated, so a new
+   * request for this GAV will miss the cache and re-run the Lookup. That
+   * Lookup blocks on the same semaphore until eviction completes, and then
+   * sees `!dir.exists()` and re-downloads. This is correct; we trade a rare
+   * unnecessary re-download for simplicity.
+   */
+  def evictGav(
+    cache: Cache[GroupArtifactVersion, NotFoundError, File],
+    coordinator: DiskCacheCoordinator,
+    gav: GroupArtifactVersion,
+    dir: File,
+    gracePeriod: Duration,
+  ): ZIO[Any, Nothing, Unit] =
+    defer:
+      val sem = coordinator.lockFor(gav).run
+      // Invalidate the cache entry first. New requests arriving after this
+      // point will miss, re-run the Lookup, and block on `sem` below.
+      cache.invalidate(gav).run
+      // Grace period: let any reader that already has a `File` from the cache
+      // finish reading it before we delete the directory.
+      ZIO.sleep(gracePeriod).run
+      sem.withPermit(ZIO.attemptBlockingIO(deleteDirBlocking(dir)).ignoreLogged).run
+      coordinator.forget(gav).run
+      ZIO.logInfo(s"Evicted disk cache: $gav dir=${dir.getAbsolutePath}").run
+
+  // Collects all GAVs whose last-access time is older than `now - maxIdle`.
+  def staleGavs(
+    coordinator: DiskCacheCoordinator,
+    maxIdle: Duration,
+  ): ZIO[Any, Nothing, List[GroupArtifactVersion]] =
+    Clock.instant.flatMap: now =>
+      val cutoff = now.minus(maxIdle)
+      coordinator.lastAccess.toChunk.flatMap: entries =>
+        ZIO.foreach(entries.toList): (gav, ref) =>
+          ref.get.map: last =>
+            if last.isBefore(cutoff) then Some(gav) else None
+        .map(_.flatten)
 
   def gav(groupId: String, artifactId: String, version: String) =
     GroupArtifactVersion(GroupId(groupId), ArtifactId(artifactId), Version(version))
@@ -42,7 +188,7 @@ object Extractor:
       .someOrFail(LatestNotFound(groupArtifact))
 
   def javadoc(groupArtifactVersion: GroupArtifactVersion):
-      ZIO[Client & FetchBlocker & TmpDir & Scope, NotFoundError, File] =
+      ZIO[Client & FetchBlocker & TmpDir & JavadocDiskCoordinator & Scope, NotFoundError, File] =
     val javadocUriOrDie: ZIO[Client & Scope, NotFoundError, URL] = MavenCentral.javadocUri(groupArtifactVersion.groupId, groupArtifactVersion.artifactId, groupArtifactVersion.version).catchAll:
       case t: Throwable => ZIO.die(t)
       case javadocNotFoundError: NotFoundError => ZIO.fail(javadocNotFoundError)
@@ -50,22 +196,31 @@ object Extractor:
     defer:
       val blocker = ZIO.service[FetchBlocker].run.blocker
       val tmpDir = ZIO.service[TmpDir].run
+      val coordinator = ZIO.service[JavadocDiskCoordinator].run.value
       val javadocDir = File(tmpDir.dir, groupArtifactVersion.toString)
 
-      if !javadocDir.exists() then
-        val javadocUrl = javadocUriOrDie.run
-        val promise = Promise.make[Nothing, Unit].run
-        val existing = blocker.putIfAbsent(groupArtifactVersion, promise).run
-        existing match
-          case Some(existingPromise) =>
-            existingPromise.await.run
-          case None =>
-            ZIO.logInfo(s"Downloading javadoc: $javadocUrl").run
-            val duration = MavenCentral.downloadAndExtractZip(javadocUrl, javadocDir)
-              .ensuring(promise.succeed(()) *> blocker.remove(groupArtifactVersion))
-              .orDie.timed.map(_._1).run
-            ZIO.logInfo(s"Downloaded javadoc: $groupArtifactVersion duration=${duration.toMillis}ms").run
+      val sem = coordinator.lockFor(groupArtifactVersion).run
+      // The semaphore serializes this section with the eviction janitor. The
+      // exists-check + download + any required re-download after eviction all
+      // run atomically with respect to `invalidate + deleteDir`.
+      sem.withPermit:
+        defer:
+          if !javadocDir.exists() then
+            val javadocUrl = javadocUriOrDie.run
+            val promise = Promise.make[Nothing, Unit].run
+            val existing = blocker.putIfAbsent(groupArtifactVersion, promise).run
+            existing match
+              case Some(existingPromise) =>
+                existingPromise.await.run
+              case None =>
+                ZIO.logInfo(s"Downloading javadoc: $javadocUrl").run
+                val duration = MavenCentral.downloadAndExtractZip(javadocUrl, javadocDir)
+                  .ensuring(promise.succeed(()) *> blocker.remove(groupArtifactVersion))
+                  .orDie.timed.map(_._1).run
+                ZIO.logInfo(s"Downloaded javadoc: $groupArtifactVersion duration=${duration.toMillis}ms").run
+      .run
 
+      coordinator.touch(groupArtifactVersion).run
       javadocDir
 
   def index(groupArtifactVersion: GroupArtifactVersion):
@@ -73,7 +228,7 @@ object Extractor:
     javadocSymbolContents(groupArtifactVersion, "index.html")
 
   def sources(groupArtifactVersion: GroupArtifactVersion):
-      ZIO[Client & FetchSourcesBlocker & TmpDir & Scope, NotFoundError, File] =
+      ZIO[Client & FetchSourcesBlocker & TmpDir & SourcesDiskCoordinator & Scope, NotFoundError, File] =
     val sourcesUriOrDie: ZIO[Client & Scope, NotFoundError, URL] = MavenCentral.sourcesUri(groupArtifactVersion.groupId, groupArtifactVersion.artifactId, groupArtifactVersion.version).catchAll:
       case t: Throwable => ZIO.die(t)
       case sourcesNotFoundError: NotFoundError => ZIO.fail(sourcesNotFoundError)
@@ -81,22 +236,28 @@ object Extractor:
     defer:
       val blocker = ZIO.service[FetchSourcesBlocker].run.blocker
       val tmpDir = ZIO.service[TmpDir].run
+      val coordinator = ZIO.service[SourcesDiskCoordinator].run.value
       val sourcesDir = File(tmpDir.dir, s"${groupArtifactVersion.toString}-sources")
 
-      if !sourcesDir.exists() then
-        val promise = Promise.make[Nothing, Unit].run
-        val existing = blocker.putIfAbsent(groupArtifactVersion, promise).run
-        existing match
-          case Some(existingPromise) =>
-            existingPromise.await.run
-          case None =>
-            val sourcesUrl = sourcesUriOrDie.run
-            ZIO.logInfo(s"Downloading sources: $sourcesUrl").run
-            val duration = MavenCentral.downloadAndExtractZip(sourcesUrl, sourcesDir)
-              .ensuring(promise.succeed(()) *> blocker.remove(groupArtifactVersion))
-              .orDie.timed.map(_._1).run
-            ZIO.logInfo(s"Downloaded sources: $groupArtifactVersion duration=${duration.toMillis}ms").run
+      val sem = coordinator.lockFor(groupArtifactVersion).run
+      sem.withPermit:
+        defer:
+          if !sourcesDir.exists() then
+            val promise = Promise.make[Nothing, Unit].run
+            val existing = blocker.putIfAbsent(groupArtifactVersion, promise).run
+            existing match
+              case Some(existingPromise) =>
+                existingPromise.await.run
+              case None =>
+                val sourcesUrl = sourcesUriOrDie.run
+                ZIO.logInfo(s"Downloading sources: $sourcesUrl").run
+                val duration = MavenCentral.downloadAndExtractZip(sourcesUrl, sourcesDir)
+                  .ensuring(promise.succeed(()) *> blocker.remove(groupArtifactVersion))
+                  .orDie.timed.map(_._1).run
+                ZIO.logInfo(s"Downloaded sources: $groupArtifactVersion duration=${duration.toMillis}ms").run
+      .run
 
+      coordinator.touch(groupArtifactVersion).run
       sourcesDir
 
   def javadocFile(groupArtifactVersion: GroupArtifactVersion, javadocDir: File, path: String):
@@ -205,8 +366,8 @@ object Extractor:
   def javadocContents(groupArtifactVersion: GroupArtifactVersion):
       ZIO[JavadocCache & Client & FetchBlocker & Scope, MavenCentral.NotFoundError, Set[Content]] =
     defer:
-      val javadocCache = ZIO.service[JavadocCache].run.cache
-      val javadocDir = javadocCache.get(groupArtifactVersion).run
+      val javadocCache = ZIO.service[JavadocCache].run
+      val javadocDir = javadocCache.getDir(groupArtifactVersion).run
 
       javadocScalaFormat(groupArtifactVersion, javadocDir)
         .orElse(javadocKotlinFormat(groupArtifactVersion, javadocDir))
@@ -229,8 +390,8 @@ object Extractor:
   def sourceContents(groupArtifactVersion: GroupArtifactVersion):
       ZIO[SourcesCache & Client & FetchSourcesBlocker & Scope, MavenCentral.NotFoundError, Set[String]] =
     defer:
-      val sourcesCache = ZIO.service[SourcesCache].run.cache
-      val sourcesDir = sourcesCache.get(groupArtifactVersion).run
+      val sourcesCache = ZIO.service[SourcesCache].run
+      val sourcesDir = sourcesCache.getDir(groupArtifactVersion).run
       fileList(sourcesDir.toPath).run
 
 
@@ -246,8 +407,8 @@ object Extractor:
   def javadocSymbolContents(groupArtifactVersion: GroupArtifactVersion, path: String):
       ZIO[JavadocCache & Client & FetchBlocker & Scope, NotFoundError | JavadocFileNotFound | JavadocContentError, String] =
     defer:
-      val javadocCache = ZIO.service[JavadocCache].run.cache
-      val javadocDir = javadocCache.get(groupArtifactVersion).run
+      val javadocCache = ZIO.service[JavadocCache].run
+      val javadocDir = javadocCache.getDir(groupArtifactVersion).run
 
       javadocFile(groupArtifactVersion, javadocDir, path)
         .flatMap: file =>
@@ -265,8 +426,8 @@ object Extractor:
   def sourceFileContents(groupArtifactVersion: GroupArtifactVersion, path: String):
       ZIO[SourcesCache & Client & FetchSourcesBlocker & Scope, NotFoundError | JavadocFileNotFound, String] =
     defer:
-      val sourcesCache = ZIO.service[SourcesCache].run.cache
-      val sourcesDir = sourcesCache.get(groupArtifactVersion).run
+      val sourcesCache = ZIO.service[SourcesCache].run
+      val sourcesDir = sourcesCache.getDir(groupArtifactVersion).run
 
       javadocFile(groupArtifactVersion, sourcesDir, path)
         .flatMap: file =>

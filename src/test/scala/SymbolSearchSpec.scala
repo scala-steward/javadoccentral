@@ -99,6 +99,7 @@ object SymbolSearchSpec extends ZIOSpecDefault:
     ).provide(
       Scope.default,
       Client.default,
+      App.javadocDiskCoordinatorLayer,
       App.javadocCacheLayer,
       App.blockerLayer,
       App.tmpDirLayer,
@@ -130,6 +131,7 @@ object SymbolSearchSpec extends ZIOSpecDefault:
     ).provide(
       Scope.default,
       Client.default,
+      App.javadocDiskCoordinatorLayer,
       App.javadocCacheLayer,
       App.blockerLayer,
       App.tmpDirLayer,

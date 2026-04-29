@@ -13,6 +13,8 @@ object AppTest extends ZIOAppDefault:
       App.blockerLayer,
       App.sourcesBlockerLayer,
       App.latestCacheLayer,
+      App.javadocDiskCoordinatorLayer,
+      App.sourcesDiskCoordinatorLayer,
       App.javadocCacheLayer,
       App.sourcesCacheLayer,
       App.tmpDirLayer,
@@ -21,7 +23,6 @@ object AppTest extends ZIOAppDefault:
       ZLayer.succeed[CodecSupplier](SymbolSearch.ProtobufCodecSupplier),
       SymbolSearch.herokuInferenceLayer.orElse(MockInference.layer),
       BadActor.live,
-      Web.crawlerEvictionsLayer,
       Web.crawlerGavLimiterLayer,
       App.symbolSearchGuardLayer,
     )

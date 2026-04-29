@@ -200,6 +200,8 @@ object AppSpec extends ZIOSpecDefault:
   ).provide(
     App.blockerLayer,
     App.sourcesBlockerLayer,
+    App.javadocDiskCoordinatorLayer,
+    App.sourcesDiskCoordinatorLayer,
     App.javadocCacheLayer,
     App.sourcesCacheLayer,
     App.latestCacheLayer,
@@ -211,7 +213,6 @@ object AppSpec extends ZIOSpecDefault:
     ZLayer.succeed[CodecSupplier](SymbolSearch.ProtobufCodecSupplier),
     SymbolSearch.herokuInferenceLayer.orElse(MockInference.layer),
     BadActor.live,
-    Web.crawlerEvictionsLayer,
-      Web.crawlerGavLimiterLayer,
+    Web.crawlerGavLimiterLayer,
       App.symbolSearchGuardLayer,
   ) @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom @@ TestAspect.withLiveSystem @@ TestAspect.sequential
