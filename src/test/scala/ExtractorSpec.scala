@@ -166,11 +166,7 @@ object ExtractorSpec extends ZIOSpecDefault:
   ).provide(
     Scope.default,
     Client.default,
-    App.javadocDiskCoordinatorLayer,
-    App.sourcesDiskCoordinatorLayer,
     App.javadocCacheLayer,
     App.sourcesCacheLayer,
-    App.blockerLayer,
-    App.sourcesBlockerLayer,
     App.tmpDirLayer,
   )

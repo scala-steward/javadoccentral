@@ -99,9 +99,7 @@ object SymbolSearchSpec extends ZIOSpecDefault:
     ).provide(
       Scope.default,
       Client.default,
-      App.javadocDiskCoordinatorLayer,
       App.javadocCacheLayer,
-      App.blockerLayer,
       App.tmpDirLayer,
       EmbeddedRedis.layer,
       Redis.singleNode,
@@ -131,9 +129,7 @@ object SymbolSearchSpec extends ZIOSpecDefault:
     ).provide(
       Scope.default,
       Client.default,
-      App.javadocDiskCoordinatorLayer,
       App.javadocCacheLayer,
-      App.blockerLayer,
       App.tmpDirLayer,
       App.redisConfigLayer,
       App.redisAuthLayer,

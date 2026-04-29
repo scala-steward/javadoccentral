@@ -114,7 +114,7 @@ object SymbolSearch:
       val workaroundForMarkdownContent = choice.message.content.replace("```json", "").replace("```", "").trim
       workaroundForMarkdownContent.fromJson[Set[MavenCentral.GroupArtifact]].getOrElse(Set.empty)
 
-  def search(symbol: String): ZIO[Redis & HerokuInference & Scope & Client & Extractor.FetchBlocker & Extractor.JavadocCache & SymbolSearchGuard, SearchError, Set[MavenCentral.GroupArtifact]] =
+  def search(symbol: String): ZIO[Redis & HerokuInference & Scope & Client & Extractor.JavadocCache & Extractor.TmpDir & SymbolSearchGuard, SearchError, Set[MavenCentral.GroupArtifact]] =
     defer:
       val redis = ZIO.service[Redis].run
 
@@ -214,7 +214,7 @@ object SymbolSearch:
   // we only want to trigger symbol cache loading when the index page is loaded
   // this is a lazy way to populate the cache
   def indexJavadocContents(groupArtifactVersion: MavenCentral.GroupArtifactVersion):
-    ZIO[Client & Extractor.FetchBlocker & Extractor.JavadocCache & Redis & SymbolSearch.SymbolSearchGuard & Scope, Nothing, Unit] =
+    ZIO[Client & Extractor.JavadocCache & Extractor.TmpDir & Redis & SymbolSearch.SymbolSearchGuard & Scope, Nothing, Unit] =
 
     val getContentsAndUpdateIndex = defer:
       ZIO.logInfo(s"Index load started: $groupArtifactVersion").run

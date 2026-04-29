@@ -1,42 +1,24 @@
 import com.jamesward.zio_mavencentral.MavenCentral
 import zio.*
-import zio.cache.{Cache, Lookup}
+import zio.cache.{ScopedCache, ScopedLookup}
 import zio.direct.*
 import zio.test.*
 
 import java.io.File
 import java.nio.file.Files
+import scala.jdk.CollectionConverters.*
 
 /**
- * Tests for the time-based disk-cache eviction introduced alongside the
- * 2h TTL on JavadocCache/SourcesCache. The mechanism is:
+ * Tests for the disk-backed cache implementation.
  *
- * 1. `DiskCacheCoordinator` tracks last-access time + per-GAV semaphores.
- * 2. `Extractor.evictGav` invalidates the cache entry, sleeps a grace
- *    period to let in-flight readers finish, then (under the per-GAV
- *    semaphore) deletes the directory and forgets the GAV.
- * 3. A fetch that runs concurrently with eviction synchronizes via the
- *    same per-GAV semaphore, so it never races with the delete.
+ * The cache is backed by `zio.cache.ScopedCache`: each entry owns a `Scope`
+ * whose finalizer deletes the extracted directory. Eviction — whether
+ * triggered by capacity overflow, TTL expiry, or explicit invalidation —
+ * closes the scope, which runs the finalizer. Per-entry reference counting
+ * inside `ScopedCache` ensures a concurrent reader's directory is not
+ * deleted while still in use.
  */
 object DiskCacheEvictionSpec extends ZIOSpecDefault:
-
-  private val gav = Extractor.gav("test.group", "test-artifact", "1.0.0")
-
-  // Makes a temporary directory + a File pointing to a per-GAV subdir inside it.
-  // The subdir is pre-populated with one file, mimicking the state after a
-  // successful javadoc extraction.
-  private def mkTmpDirWithGavContent: ZIO[Scope, Nothing, (File, File)] =
-    defer:
-      val tmp = ZIO.attempt(Files.createTempDirectory("eviction-test").nn.toFile).orDie.run
-      ZIO.addFinalizer(ZIO.attempt(recursivelyDelete(tmp)).ignore).run
-      val gavDir = File(tmp, gav.toString)
-      ZIO.attempt:
-        gavDir.mkdirs()
-        val marker = File(gavDir, "marker.txt")
-        Files.writeString(marker.toPath, "hello")
-        ()
-      .orDie.run
-      (tmp, gavDir)
 
   private def recursivelyDelete(f: File): Unit =
     if f.isDirectory then
@@ -50,139 +32,163 @@ object DiskCacheEvictionSpec extends ZIOSpecDefault:
     f.delete()
     ()
 
-  // Builds a Cache that returns the given File and never actually fetches
-  // anything. Sufficient for exercising evictGav's cache.invalidate path.
-  private def fixedCache(returning: File): UIO[Cache[MavenCentral.GroupArtifactVersion, MavenCentral.NotFoundError, File]] =
-    Cache.make(
-      capacity = 10,
-      timeToLive = Duration.Infinity,
-      lookup = Lookup[MavenCentral.GroupArtifactVersion, Any, MavenCentral.NotFoundError, File](_ => ZIO.succeed(returning)),
-    )
+  private def countMarkers(tmp: File): ZIO[Any, Nothing, Int] =
+    ZIO.attempt:
+      import java.nio.file.Files as NioFiles
+      val stream = NioFiles.walk(tmp.toPath).nn
+      try
+        stream.iterator.nn.asScala.count(p => p.getFileName.nn.toString == "marker.txt")
+      finally stream.close()
+    .orDie
 
   def spec = suite("DiskCache eviction")(
 
-    test("evictGav invalidates the cache entry and deletes the directory") {
-      defer:
-        val (_, gavDir) = mkTmpDirWithGavContent.run
-        val coordinator = Extractor.DiskCacheCoordinator.make.run
-        val cache = fixedCache(gavDir).run
+    test("exceeding cache capacity evicts the oldest entry's directory from disk") {
+      // Reproduces the production disk-leak bug: without finalizer-based
+      // cleanup, zio-cache silently removed the LRU entry from its internal
+      // map but left the extracted directory on disk. `ScopedCache` wires
+      // the Scope to the cache entry so eviction runs the finalizer and
+      // deletes the directory.
+      val capacity = 2
+      val gavs = (1 to 5).toList.map(i => Extractor.gav("g", s"a$i", "1"))
 
-        // Populate cache + tracker
-        cache.get(gav).run
-        coordinator.touch(gav).run
+      val body = defer:
+        val tmp = ZIO.service[Extractor.TmpDir].run.dir
+        ZIO.addFinalizer(ZIO.attempt(recursivelyDelete(tmp)).ignore).run
 
+        // Pre-create the extraction dirs so `Extractor.javadoc` skips the download.
+        ZIO.foreachDiscard(gavs): g =>
+          ZIO.attempt:
+            val d = File(tmp, g.toString)
+            d.mkdirs()
+            Files.writeString(File(d, "marker.txt").toPath, g.toString)
+            ()
+          .orDie
+        .run
+
+        val cache = ScopedCache.makeWith(capacity, ScopedLookup(Extractor.javadoc)):
+          case Exit.Success(_) => Duration.Infinity
+          case Exit.Failure(_) => Duration.Zero
+        .run
+        val jc = Extractor.JavadocCache(cache)
+
+        // Pull each GAV through the cache inside its own scope, so each
+        // caller releases its owner reference after reading. Once we exceed
+        // capacity, the oldest entry is evicted — and its finalizer deletes
+        // the directory.
+        ZIO.foreachDiscard(gavs): g =>
+          ZIO.scoped:
+            jc.getDir(g).unit
+          .catchAll(e => ZIO.dieMessage(s"unexpected error: $e"))
+        .run
+
+        val cachedEntries = cache.size.run
+        val markersOnDisk = countMarkers(tmp).run
+
+        assertTrue(
+          cachedEntries == capacity,
+          // Only the entries still in the cache should remain on disk.
+          markersOnDisk == capacity,
+        )
+
+      body.provide(
+        ZLayer.fromZIO(
+          ZIO.attempt(Files.createTempDirectory("cap-overflow-test").nn.toFile).orDie.map(Extractor.TmpDir(_))
+        ),
+        zio.http.Client.default,
+        Scope.default,
+      )
+    },
+
+    test("invalidating a cache entry deletes its directory") {
+      val gav = Extractor.gav("g", "a", "1")
+
+      val body = defer:
+        val tmp = ZIO.service[Extractor.TmpDir].run.dir
+        ZIO.addFinalizer(ZIO.attempt(recursivelyDelete(tmp)).ignore).run
+
+        // Pre-create the extraction dir.
+        val gavDir = File(tmp, gav.toString)
+        ZIO.attempt:
+          gavDir.mkdirs()
+          Files.writeString(File(gavDir, "marker.txt").toPath, "hello")
+          ()
+        .orDie.run
+
+        val cache = ScopedCache.makeWith(10, ScopedLookup(Extractor.javadoc)):
+          case Exit.Success(_) => Duration.Infinity
+          case Exit.Failure(_) => Duration.Zero
+        .run
+        val jc = Extractor.JavadocCache(cache)
+
+        // Populate the cache.
+        ZIO.scoped(jc.getDir(gav).unit).run
         val existedBefore = gavDir.exists()
-        val cachedBefore = cache.contains(gav).run
-        val trackedBefore = coordinator.lastAccess.get(gav).run.isDefined
 
-        Extractor.evictGav(cache, coordinator, gav, gavDir, gracePeriod = Duration.Zero).run
-
+        // Explicit invalidation should also delete the dir.
+        cache.invalidate(gav).run
         val existedAfter = gavDir.exists()
-        val cachedAfter = cache.contains(gav).run
-        val trackedAfter = coordinator.lastAccess.get(gav).run.isDefined
 
-        assertTrue(
-          existedBefore,
-          cachedBefore,
-          trackedBefore,
-          !existedAfter,
-          !cachedAfter,
-          !trackedAfter,
-        )
+        assertTrue(existedBefore, !existedAfter)
+
+      body.provide(
+        ZLayer.fromZIO(
+          ZIO.attempt(Files.createTempDirectory("invalidate-test").nn.toFile).orDie.map(Extractor.TmpDir(_))
+        ),
+        zio.http.Client.default,
+        Scope.default,
+      )
     },
 
-    test("evictGav waits out the grace period before deleting") {
-      // During the grace period the cache entry is already invalidated
-      // but the directory still exists so in-flight readers can finish.
-      defer:
-        val (_, gavDir) = mkTmpDirWithGavContent.run
-        val coordinator = Extractor.DiskCacheCoordinator.make.run
-        val cache = fixedCache(gavDir).run
+    test("concurrent lookups for the same key run the scoped lookup only once") {
+      // Validates that ScopedCache deduplicates concurrent lookups via its
+      // `Pending` state — the behavior that replaced the explicit FetchBlocker
+      // (ConcurrentMap[GAV, Promise]) pattern.
+      val gav = Extractor.gav("g", "a", "1")
+      val fibers = 20
 
-        cache.get(gav).run
-        coordinator.touch(gav).run
+      val body = defer:
+        val tmp = ZIO.service[Extractor.TmpDir].run.dir
+        ZIO.addFinalizer(ZIO.attempt(recursivelyDelete(tmp)).ignore).run
 
-        val evictFiber = Extractor.evictGav(cache, coordinator, gav, gavDir, gracePeriod = 5.seconds).fork.run
+        val callCount = Ref.make(0).run
 
-        // Let the invalidate happen, but stay inside the grace period
-        TestClock.adjust(100.millis).run
-        // Cache should be invalidated already, directory still present.
-        val midCached = cache.contains(gav).run
-        val midDirExists = gavDir.exists()
+        // A custom lookup that counts invocations and produces a temp dir.
+        // Intentionally slow so all fibers race on the Pending state.
+        val lookup: ScopedLookup[MavenCentral.GroupArtifactVersion, Any, MavenCentral.NotFoundError, File] =
+          ScopedLookup: key =>
+            defer:
+              callCount.update(_ + 1).run
+              ZIO.sleep(100.millis).run
+              val dir = File(tmp, key.toString)
+              ZIO.attempt:
+                dir.mkdirs()
+                Files.writeString(File(dir, "marker.txt").toPath, "hello")
+                ()
+              .orDie.run
+              ZIO.addFinalizer(ZIO.attempt(recursivelyDelete(dir)).ignore).run
+              dir
 
-        // Advance past the grace period
-        TestClock.adjust(6.seconds).run
-        evictFiber.join.run
+        val cache = ScopedCache.makeWith(10, lookup):
+          case Exit.Success(_) => Duration.Infinity
+          case Exit.Failure(_) => Duration.Zero
+        .run
 
-        assertTrue(
-          !midCached,     // cache invalidated immediately
-          midDirExists,   // directory still there during grace
-          !gavDir.exists(), // but gone after grace
-        )
+        // Race `fibers` concurrent calls for the same key.
+        ZIO.foreachPar(1 to fibers): _ =>
+          ZIO.scoped(cache.get(gav).unit)
+        .run
+
+        val observedCalls = callCount.get.run
+
+        assertTrue(observedCalls == 1)
+
+      body.provide(
+        ZLayer.fromZIO(
+          ZIO.attempt(Files.createTempDirectory("concurrent-test").nn.toFile).orDie.map(Extractor.TmpDir(_))
+        ),
+        Scope.default,
+      )
     },
 
-    test("staleGavs returns only GAVs whose last-access is older than maxIdle") {
-      defer:
-        val coordinator = Extractor.DiskCacheCoordinator.make.run
-        val fresh = Extractor.gav("g", "fresh", "1")
-        val stale = Extractor.gav("g", "stale", "1")
-
-        coordinator.touch(stale).run
-        // Pretend two hours passed
-        TestClock.adjust(2.hours + 1.minute).run
-        coordinator.touch(fresh).run
-
-        val result = Extractor.staleGavs(coordinator, 2.hours).run
-
-        assertTrue(
-          result.contains(stale),
-          !result.contains(fresh),
-        )
-    },
-
-    test("eviction waits for an in-progress fetch (semaphore serialization)") {
-      // Simulates: fetch grabs the semaphore and holds it across a "download".
-      // Eviction fires. The delete half of eviction must wait until fetch
-      // releases the semaphore.
-      defer:
-        val (_, gavDir) = mkTmpDirWithGavContent.run
-        val coordinator = Extractor.DiskCacheCoordinator.make.run
-        val cache = fixedCache(gavDir).run
-
-        cache.get(gav).run
-        coordinator.touch(gav).run
-
-        val sem = coordinator.lockFor(gav).run
-        val fetchStarted = Promise.make[Nothing, Unit].run
-        val fetchRelease = Promise.make[Nothing, Unit].run
-
-        // Simulated fetch holding the lock
-        val fetchFiber =
-          sem.withPermit(fetchStarted.succeed(()) *> fetchRelease.await).fork.run
-
-        fetchStarted.await.run
-
-        // Start eviction while fetch holds the lock
-        val evictFiber =
-          Extractor.evictGav(cache, coordinator, gav, gavDir, gracePeriod = Duration.Zero).fork.run
-
-        // Give the eviction fiber a chance to try to acquire the permit.
-        // The cache.invalidate step runs *before* the permit is acquired, so
-        // it should already be done. The delete, however, should be blocked.
-        TestClock.adjust(200.millis).run
-        val cachedWhileFetching = cache.contains(gav).run
-        val dirExistsWhileFetching = gavDir.exists()
-
-        // Let the fetch complete so the eviction can proceed
-        fetchRelease.succeed(()).run
-        fetchFiber.join.run
-        evictFiber.join.run
-
-        assertTrue(
-          !cachedWhileFetching,     // invalidate ran before blocking on lock
-          dirExistsWhileFetching,   // but delete was blocked
-          !gavDir.exists(),         // and proceeded once fetch released
-        )
-    },
-
-  ) @@ TestAspect.withLiveRandom
+  ) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock

@@ -18,7 +18,7 @@ Start the test server with: `./sbt ~reStartTest` (for auto-reloading) or `./sbt 
 - ZIO 2 for effects, concurrency, and application wiring
 - zio-http for HTTP server and client
 - zio-direct (`defer`/`.run`) as the primary effect composition style
-- zio-cache for in-memory caching
+- zio-cache for in-memory caching (prefer `ScopedCache` when cached values own external resources — see "Caching disk-backed values" below)
 - zio-redis for persistent storage (symbol search index)
 - zio-schema with protobuf codec for Redis serialization
 - sbt build tool
@@ -110,3 +110,36 @@ private def scheduleCrawlerEviction(gav: GAV): ZIO[...] =
 - 30-second request timeout (H12 error)
 - `-XX:+ExitOnOutOfMemoryError` — OOM kills the process immediately
 - When running the `heroku` command you must not specify an app name
+
+### Caching disk-backed values
+
+`JavadocCache` and `SourcesCache` wrap `zio.cache.ScopedCache`, not the plain
+`Cache`. This matters because:
+
+- `zio.cache.Cache` has **no eviction callback**. When an entry is removed
+  (capacity overflow, TTL expiry, explicit invalidate), the in-memory map
+  just drops the reference. If the cached value owns external state (like
+  an extracted directory on disk), that state leaks.
+- `zio.cache.ScopedCache` gives each entry its own `Scope`. Eviction closes
+  the scope, which runs any finalizer registered inside the lookup. Per-
+  entry reference counting inside `ScopedCache` ensures a concurrent reader
+  is not cut off mid-read when eviction fires.
+
+The pattern used here:
+
+```scala
+// Scoped lookup — returns ZIO[Scope, E, File] and registers a cleanup finalizer.
+def javadoc(gav: GAV): ZIO[Client & TmpDir & Scope, NotFoundError, File] =
+  defer:
+    val dir = extractTo(tmpDir, gav).run
+    ZIO.addFinalizer(deleteDirBlocking(dir).ignoreLogged).run
+    dir
+
+val cache = ScopedCache.makeWith(capacity, ScopedLookup(Extractor.javadoc)):
+  case Exit.Success(_) => javadocCacheTtl
+  case Exit.Failure(_) => Duration.Zero
+```
+
+Callers consume `getDir` inside `ZIO.scoped` so their owner reference is
+released after use. `ScopedCache` also runs its own background TTL sweeper
+(once per second) — no custom janitor is needed.

@@ -1,6 +1,6 @@
 import com.jamesward.zio_mavencentral.MavenCentral
 import zio.*
-import zio.cache.{Cache, Lookup}
+import zio.cache.{Cache, Lookup, ScopedCache, ScopedLookup}
 import zio.concurrent.ConcurrentMap
 import zio.direct.*
 import zio.http.*
@@ -19,52 +19,31 @@ object App extends ZIOAppDefault:
         maybePort.fold(Server.default)(Server.defaultWithPort)
     .flatten
 
-  val blockerLayer: ZLayer[Any, Nothing, Extractor.FetchBlocker] =
-    ZLayer.fromZIO(ConcurrentMap.empty[MavenCentral.GroupArtifactVersion, Promise[Nothing, Unit]].map(Extractor.FetchBlocker(_)))
-
-  val sourcesBlockerLayer: ZLayer[Any, Nothing, Extractor.FetchSourcesBlocker] =
-    ZLayer.fromZIO(ConcurrentMap.empty[MavenCentral.GroupArtifactVersion, Promise[Nothing, Unit]].map(Extractor.FetchSourcesBlocker(_)))
-
   val latestCacheLayer: ZLayer[Client & Scope, Nothing, Extractor.LatestCache] = ZLayer.fromZIO:
     Cache.makeWith(1_000, Lookup(Extractor.latest)):
       case Exit.Success(_) => 1.hour
       case Exit.Failure(_) => Duration.Zero
     .map(Extractor.LatestCache(_))
 
-  // Directories extracted for cached javadoc/sources entries live on the
-  // dyno's ephemeral filesystem and contribute to memory pressure via the
-  // kernel page cache. A 2-hour TTL (with a background janitor that deletes
-  // the directory when a cache entry expires) keeps disk usage bounded for
-  // the common traffic pattern: a burst of requests for one artifact, then
-  // quiet. Capacity is also dropped to 100 entries to bound worst-case disk
-  // usage within any 2-hour window.
+  // Extracted javadoc/sources directories live on the dyno's ephemeral disk
+  // and contribute to memory pressure via the kernel page cache. The cache
+  // is backed by `zio.cache.ScopedCache` so each entry owns a Scope; the
+  // scope's finalizer deletes the directory the moment the entry is evicted
+  // (capacity overflow, TTL expiry, or explicit invalidation).
   val javadocCacheTtl: Duration = 2.hours
   val javadocCacheCapacity: Int = 100
-  val javadocEvictGracePeriod: Duration = 60.seconds
 
-  val javadocDiskCoordinatorLayer: ZLayer[Any, Nothing, Extractor.JavadocDiskCoordinator] =
-    ZLayer.fromZIO(Extractor.DiskCacheCoordinator.make.map(Extractor.JavadocDiskCoordinator(_)))
+  val javadocCacheLayer: ZLayer[Client & Extractor.TmpDir & Scope, Nothing, Extractor.JavadocCache] = ZLayer.fromZIO:
+    ScopedCache.makeWith(javadocCacheCapacity, ScopedLookup(Extractor.javadoc)):
+      case Exit.Success(_) => javadocCacheTtl
+      case Exit.Failure(_) => Duration.Zero
+    .map(Extractor.JavadocCache(_))
 
-  val sourcesDiskCoordinatorLayer: ZLayer[Any, Nothing, Extractor.SourcesDiskCoordinator] =
-    ZLayer.fromZIO(Extractor.DiskCacheCoordinator.make.map(Extractor.SourcesDiskCoordinator(_)))
-
-  val javadocCacheLayer: ZLayer[Client & Extractor.FetchBlocker & Extractor.TmpDir & Extractor.JavadocDiskCoordinator & Scope, Nothing, Extractor.JavadocCache] = ZLayer.fromZIO:
-    defer:
-      val coordinator = ZIO.service[Extractor.JavadocDiskCoordinator].run.value
-      val cache = Cache.makeWith(javadocCacheCapacity, Lookup(Extractor.javadoc)):
-        case Exit.Success(_) => javadocCacheTtl
-        case Exit.Failure(_) => Duration.Zero
-      .run
-      Extractor.JavadocCache(cache, coordinator)
-
-  val sourcesCacheLayer: ZLayer[Client & Extractor.FetchSourcesBlocker & Extractor.TmpDir & Extractor.SourcesDiskCoordinator & Scope, Nothing, Extractor.SourcesCache] = ZLayer.fromZIO:
-    defer:
-      val coordinator = ZIO.service[Extractor.SourcesDiskCoordinator].run.value
-      val cache = Cache.makeWith(javadocCacheCapacity, Lookup(Extractor.sources)):
-        case Exit.Success(_) => javadocCacheTtl
-        case Exit.Failure(_) => Duration.Zero
-      .run
-      Extractor.SourcesCache(cache, coordinator)
+  val sourcesCacheLayer: ZLayer[Client & Extractor.TmpDir & Scope, Nothing, Extractor.SourcesCache] = ZLayer.fromZIO:
+    ScopedCache.makeWith(javadocCacheCapacity, ScopedLookup(Extractor.sources)):
+      case Exit.Success(_) => javadocCacheTtl
+      case Exit.Failure(_) => Duration.Zero
+    .map(Extractor.SourcesCache(_))
 
   val tmpDirLayer = ZLayer.succeed(Extractor.TmpDir(Files.createTempDirectory("jars").nn.toFile))
 
@@ -141,31 +120,8 @@ object App extends ZIOAppDefault:
       val diskBytes = ZIO.attemptBlockingIO(dirSize(tmpDir)).orDie.run
       ZIO.logInfo(s"cache stats: javadoc=$javadocCacheSize sources=$sourcesCacheSize disk=${diskBytes / 1024 / 1024}MB $jvmMemStats").run
 
-  // How often the janitor scans for GAVs with no recent access. Shorter than
-  // the TTL so that stale entries get cleaned up promptly after the idle
-  // window closes.
-  private val janitorInterval: Duration = 5.minutes
-
-  // Evicts idle javadoc and sources entries whose last-access is older than
-  // the cache TTL. Runs each candidate eviction concurrently via forkDaemon
-  // so the semaphore inside `evictGav` doesn't block the scan itself.
-  private val janitorSweep: ZIO[Extractor.JavadocCache & Extractor.SourcesCache & Extractor.TmpDir, Nothing, Unit] =
-    defer:
-      val tmpDir = ZIO.service[Extractor.TmpDir].run.dir
-      val javadocCache = ZIO.service[Extractor.JavadocCache].run
-      val sourcesCache = ZIO.service[Extractor.SourcesCache].run
-      val staleJavadocs = Extractor.staleGavs(javadocCache.coordinator, javadocCacheTtl).run
-      val staleSources = Extractor.staleGavs(sourcesCache.coordinator, javadocCacheTtl).run
-      ZIO.foreachDiscard(staleJavadocs): gav =>
-        val dir = new java.io.File(tmpDir, gav.toString)
-        ZIO.logInfo(s"Janitor scheduling javadoc eviction: $gav") *>
-          Extractor.evictGav(javadocCache.cache, javadocCache.coordinator, gav, dir, javadocEvictGracePeriod).forkDaemon
-      .run
-      ZIO.foreachDiscard(staleSources): gav =>
-        val dir = new java.io.File(tmpDir, s"$gav-sources")
-        ZIO.logInfo(s"Janitor scheduling sources eviction: $gav") *>
-          Extractor.evictGav(sourcesCache.cache, sourcesCache.coordinator, gav, dir, javadocEvictGracePeriod).forkDaemon
-      .run
+  // How often to sample cache / memory stats for the logs.
+  private val statsInterval: Duration = 1.minute
 
   // Use virtual threads for blocking operations. On JDK 21+, virtual threads
   // are lightweight (tiny stacks, mounted on a small carrier pool) and unmount
@@ -177,19 +133,16 @@ object App extends ZIOAppDefault:
     Runtime.enableLoomBasedBlockingExecutor
 
   def run =
-    // todo: log filtering so they don't show up in tests / runtime config
+    // `ScopedCache` runs its own background TTL sweeper (every second) and
+    // cleans up evicted entries via the scope finalizer registered in
+    // `Extractor.javadoc` / `Extractor.sources`. No custom janitor needed.
     val background =
-      logCacheStats.repeat(Schedule.spaced(1.minute)).forkDaemon *>
-        janitorSweep.repeat(Schedule.spaced(janitorInterval)).forkDaemon
+      logCacheStats.repeat(Schedule.spaced(statsInterval)).forkDaemon
     (background *> Server.serve(Web.appWithMiddleware)).provide(
       server,
       Client.default,
       Scope.default,
-      blockerLayer,
-      sourcesBlockerLayer,
       latestCacheLayer,
-      javadocDiskCoordinatorLayer,
-      sourcesDiskCoordinatorLayer,
       javadocCacheLayer,
       sourcesCacheLayer,
       tmpDirLayer,

@@ -210,11 +210,56 @@ object AppSpec extends ZIOSpecDefault:
           nonCrawlerSameGav.status != Status.TooManyRequests,
         )
 
+    , test("loading an index.html populates the symbol index so later search finds the artifact"):
+      // Reproduces: user loads <gav>/index.html, then searches for a substring
+      // of the artifact id (e.g. "zio") and expects the artifact in the results.
+      // `withFile` forks `SymbolSearch.indexJavadocContents` as a daemon when
+      // the request path is `index.html`; that daemon calls `Extractor.javadocContents`
+      // (which requires `JavadocCache.getDir` + scope), reads the parsed symbols,
+      // and writes them to Redis.
+      val forwardedForHeader = Header.Custom("X-Forwarded-For", "192.168.1.100")
+      // Any modular-javadoc artifact will do; zio_3 is small and well-behaved.
+      val gid = "com.jamesward"
+      val aid = "zio-http-mcp_3"
+      val ver = "0.0.7"
+      val indexPath = Path.root / gid / aid / ver / "index.html"
+      defer:
+        val indexResp = Web.appWithMiddleware.runZIO(
+          Request.get(URL(indexPath)).addHeader(forwardedForHeader)
+        ).run
+        // Drain the body so the scope on the response closes (mirroring what a
+        // real HTTP client does). Only then does the background indexing fiber
+        // see its parent scope release.
+        indexResp.body.asArray.run
+
+        // Wait up to 30s for the daemon fiber to finish indexing. The artifact
+        // id `zio_3` appears in the Redis `_groupArtifacts` set as soon as the
+        // index write completes.
+        val redis = ZIO.service[Redis].run
+        val groupArtifact = com.jamesward.zio_mavencentral.MavenCentral.GroupArtifact(
+          com.jamesward.zio_mavencentral.MavenCentral.GroupId(gid),
+          com.jamesward.zio_mavencentral.MavenCentral.ArtifactId(aid),
+        )
+        redis.sIsMember(SymbolSearch.groupArtifactsKey, groupArtifact)
+          .repeatUntil(identity)
+          .timeoutFail(new RuntimeException("index never populated"))(30.seconds)
+          .orDie.run
+
+        // Now search for "zio" — should return the artifact.
+        val searchResp = Web.appWithMiddleware.runZIO(
+          Request.get(URL(Path.root, queryParams = zio.http.QueryParams("zio" -> "")))
+            .addHeader(forwardedForHeader)
+            .addHeader(Header.Accept(MediaType.text.markdown))
+        ).run
+        val searchBody = searchResp.body.asString.run
+
+        assertTrue(
+          indexResp.status.isSuccess,
+          searchResp.status.isSuccess,
+          searchBody.contains(s"$gid:$aid"),
+        )
+
   ).provide(
-    App.blockerLayer,
-    App.sourcesBlockerLayer,
-    App.javadocDiskCoordinatorLayer,
-    App.sourcesDiskCoordinatorLayer,
     App.javadocCacheLayer,
     App.sourcesCacheLayer,
     App.latestCacheLayer,
