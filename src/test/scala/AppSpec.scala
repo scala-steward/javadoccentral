@@ -120,6 +120,19 @@ object AppSpec extends ZIOSpecDefault:
           headResp.header(Header.ETag).map(_.renderedValue) == getResp.header(Header.ETag).map(_.renderedValue),
           headResp.header(Header.CacheControl).map(_.renderedValue) == getResp.header(Header.CacheControl).map(_.renderedValue),
         )
+    , test("HEAD /mcp does not return 500"):
+      val forwardedForHeader = Header.Custom("X-Forwarded-For", "192.168.1.100")
+      defer:
+        val headResp = Web.appWithMiddleware.runZIO(
+          Request.head(URL(Path.root / "mcp")).addHeader(forwardedForHeader)
+        ).run
+        val headBody = headResp.body.asString.run
+        assertTrue(
+          headResp.status != Status.InternalServerError,
+          // GET /mcp returns 405 (MCP is POST-only); HEAD should mirror that.
+          headResp.status == Status.MethodNotAllowed,
+          headBody.isEmpty,
+        )
     , test("HEAD for unknown path returns 404 like GET (no body)"):
       val forwardedForHeader = Header.Custom("X-Forwarded-For", "192.168.1.100")
       defer:

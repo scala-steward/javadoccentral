@@ -394,7 +394,12 @@ object Web:
 
 
   val app: Routes[BadActor.Store & Extractor.LatestCache & Extractor.JavadocCache & Extractor.SourcesCache & Extractor.FetchBlocker & Extractor.FetchSourcesBlocker & Extractor.TmpDir & Client & Redis & HerokuInference & SymbolSearch.SymbolSearchGuard, Response] =
-    val mcpRoutes = MCP.mcpServer.statelessRoutes
+    // `statelessRoutes` from zio-http-mcp only registers POST/GET/DELETE on /mcp.
+    // A HEAD request would otherwise throw inside the route tree (turning into a
+    // 500 via `.sandbox`). Register HEAD /mcp explicitly so it mirrors GET's 405.
+    val mcpRoutes = MCP.mcpServer.statelessRoutes ++ Routes(
+      Method.HEAD / "mcp" -> Handler.fromResponse(Response.status(Status.MethodNotAllowed))
+    )
 
     // All read endpoints respond to both GET and HEAD. Per RFC 9110, HEAD must
     // behave exactly like GET but with no response body. Using `GET #| HEAD`

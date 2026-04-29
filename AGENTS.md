@@ -6,6 +6,12 @@
 
 JavaDoc Central — a Scala web app that serves javadocs from Maven Central artifacts. Deployed on Heroku (512MB dyno). Uses ZIO ecosystem throughout.
 
+## Build Instructions
+
+Run sbt with `./sbt`
+
+Start the test server with: `./sbt ~reStartTest` (for auto-reloading) or `./sbt runTest` for non-auto-reloading
+
 ## Tech Stack
 
 - Scala 3 (3.8.x) with `-language:strictEquality`
